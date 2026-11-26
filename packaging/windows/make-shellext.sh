@@ -39,7 +39,9 @@ MSYS2_ARG_CONV_EXCL="*" "$SDKBIN/makeappx.exe" pack /d "$(cygpath -w "$PKG")" /p
 if [ ! -f "$CERTDIR/kitty-menu.pfx" ]; then
     echo "==> creating self-signed code-signing certificate"
     mkdir -p "$CERTDIR"
-    powershell.exe -NoProfile -Command "
+    # A PSModulePath inherited from PowerShell 7 stops Windows PowerShell 5.1
+    # from loading its own PKI and Security modules; unset, 5.1 uses its defaults.
+    env -u PSModulePath powershell.exe -NoProfile -Command "
       \$c = New-SelfSignedCertificate -Type Custom -Subject 'CN=kitty-windows-port' \
         -KeyUsage DigitalSignature -FriendlyName 'kitty windows port' \
         -CertStoreLocation 'Cert:\CurrentUser\My' \
