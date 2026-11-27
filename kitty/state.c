@@ -873,7 +873,7 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
             r->left = gl_pos_x(r->px.left, osw->viewport_width);
             r->top = gl_pos_y(r->px.top, osw->viewport_height);
             r->right = r->left + gl_size(r->px.right - r->px.left, osw->viewport_width);
-            r->bottom = r->top - gl_size(r->px.bottom - r->px.top, osw->viewport_height);
+            r->bottom = r->top + gl_size(r->px.bottom - r->px.top, osw->viewport_height);
             r->color = 0 /* default_bg */;
             r->border_type = 0;
             r->horizontal = 1;
