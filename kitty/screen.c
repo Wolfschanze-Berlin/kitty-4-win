@@ -4484,7 +4484,12 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
             break;
         case BIDI_AUTODETECT: self->modes.mBIDI_AUTODETECT = val; break;
         case DECCKM: self->modes.mDECCKM = val; break;
-        case DECTCEM: self->modes.mDECTCEM = val; break;
+        case DECTCEM:
+#ifdef _WIN32
+            if (!val && self->modes.mDECTCEM) self->cursor_hidden_at = self->parsing_at;
+#endif
+            self->modes.mDECTCEM = val;
+            break;
         case DECSCNM:
             // Render screen in reverse video
             if (self->modes.mDECSCNM != val) {
@@ -4514,7 +4519,16 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
         case TOGGLE_ALT_SCREEN_2:
         case ALTERNATE_SCREEN:
             if (val && self->linebuf == self->main_linebuf) screen_toggle_screen_buffer(self, mode == ALTERNATE_SCREEN, mode == ALTERNATE_SCREEN);
-            else if (!val && self->linebuf != self->main_linebuf) screen_toggle_screen_buffer(self, mode == ALTERNATE_SCREEN, mode == ALTERNATE_SCREEN);
+            else if (!val && self->linebuf != self->main_linebuf) {
+                screen_toggle_screen_buffer(self, mode == ALTERNATE_SCREEN, mode == ALTERNATE_SCREEN);
+#ifdef _WIN32
+                // A full-screen program in a Windows pseudoconsole just switched
+                // back to the main screen. conhost withholds the shell's following
+                // output (its prompt) until it receives input, so ask the window to
+                // nudge the pseudoconsole and force a flush.
+                CALLBACK("windows_conpty_flush", NULL);
+#endif
+            }
             break;
         case 7727 << 5: log_error("Application escape mode is not supported, the extended keyboard protocol should be used instead"); break;
         case PENDING_MODE << 5:
@@ -4525,6 +4539,10 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
         case INBAND_RESIZE_NOTIFICATION:
             self->modes.mINBAND_RESIZE_NOTIFICATION = val;
             if (val) CALLBACK("notify_child_of_resize", NULL);
+            break;
+        case 9001 << 5:
+            // win32-input-mode, enabled unconditionally by the Windows ConPTY.
+            // kitty uses the extended keyboard protocol instead, so ignore it.
             break;
         case VISIBILITY_REPORTS:
             self->modes.mVISIBILITY_REPORTS = val;
@@ -9240,6 +9258,29 @@ start_selection(Screen *self, PyObject *args) {
 }
 
 static PyObject *
+select_all(Screen *self, PyObject *a UNUSED) {
+    screen_pause_rendering(self, false, 0);
+    ensure_space_for(&self->selections, items, Selection, 1, capacity, 1, false);
+    memset(self->selections.items, 0, sizeof(Selection));
+    self->selections.count = 1;
+    self->selections.in_progress = false;
+    self->selections.extend_mode = EXTEND_CELL;
+    Selection *s = self->selections.items;
+    s->last_rendered.y = INT_MAX;
+    // Absolute y is boundary.y - scrolled_by, so a start scroll of the whole
+    // history count anchors the start at the oldest scrollback line. The end runs
+    // to the bottom-right cell of the last screen line (end in the right half of
+    // the cell so that cell is included).
+    s->start_scrolled_by = self->historybuf->count;
+    s->start.in_left_half_of_cell = true;
+    s->end.x = self->columns ? self->columns - 1 : 0;
+    s->end.y = self->lines ? self->lines - 1 : 0;
+    s->input_start = s->start;
+    s->input_current = s->end;
+    Py_RETURN_NONE;
+}
+
+static PyObject *
 is_rectangle_select(Screen *self, PyObject *a UNUSED) {
     if (self->selections.count && self->selections.items[0].rectangle_select) Py_RETURN_TRUE;
     Py_RETURN_FALSE;
@@ -11064,7 +11105,7 @@ static PyMethodDef methods[] = {
     MND(as_text, METH_VARARGS) MND(as_text_non_visual, METH_VARARGS) MND(as_text_for_history_buf, METH_VARARGS) MND(as_text_alternate, METH_VARARGS)
         MND(cmd_output, METH_VARARGS) MND(tab, METH_NOARGS) MND(backspace, METH_NOARGS) MND(linefeed, METH_NOARGS) MND(carriage_return, METH_NOARGS)
             MND(set_tab_stop, METH_NOARGS) MND(clear_tab_stop, METH_VARARGS) MND(reset_tab_stops, METH_NOARGS) MND(start_selection, METH_VARARGS)
-                MND(update_selection, METH_VARARGS){"clear_selection", (PyCFunction)clear_selection_, METH_NOARGS, ""},
+                MND(update_selection, METH_VARARGS) MND(select_all, METH_NOARGS){"clear_selection", (PyCFunction)clear_selection_, METH_NOARGS, ""},
     MND(reverse_index, METH_NOARGS) MND(mark_as_dirty, METH_NOARGS) MND(reload_all_gpu_data, METH_NOARGS) MND(resize, METH_VARARGS)
         MND(ignore_bells_for, METH_VARARGS) MND(set_margins, METH_VARARGS) MND(detect_url, METH_VARARGS) MND(rescale_images, METH_NOARGS)
             MND(current_key_encoding_flags, METH_NOARGS) MND(text_for_selection, METH_VARARGS) MND(text_for_marked_url, METH_VARARGS)

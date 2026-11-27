@@ -53,7 +53,7 @@ from kitty.shaders.slang import (
     variant_name,
 )
 
-from .base import BaseTest
+from .base import BaseTest, is_windows
 
 _SUPPORT_SHADER_NAMES = frozenset(('types', 'pipeline'))
 
@@ -237,6 +237,19 @@ struct vertex_main_Result_0
                 self.assertLess(int(nn[block][len('buffer(') : -1]), 15, name)
             for ep in m['entry_points'].values():
                 self.assertIn(f' {ep}(', code, name)
+
+    def test_slangc_from_a_windows_path(self):
+        # A Windows path in SLANGC has backslashes, which POSIX shell rules eat
+        if not is_windows:
+            self.skipTest('Windows paths only')
+        from kitty import constants
+
+        for value, expected in (
+            (r'C:\slang\bin\slangc.exe', ('C:/slang/bin/slangc.exe',)),
+            (r'"C:\Program Files\slang\slangc.exe" -v', ('C:/Program Files/slang/slangc.exe', '-v')),
+        ):
+            with patch.object(constants, '_slangc', ()), patch.dict(os.environ, {'SLANGC': value}):
+                self.ae(constants.slangc(), expected)
 
     def test_animation_step_parsing(self):
         def step(val):
@@ -1269,7 +1282,10 @@ float f() { static const float SCAN = 2; return SCAN; }
             notch = w('notch.slang', '// notch shader\n')
             w('pipelines/other.slang', '// other\n')
             orig_home = os.environ.get('HOME')
+            orig_profile = os.environ.get('USERPROFILE')
             os.environ['HOME'] = tmpdir
+            # ~ is the profile folder on Windows, which expanduser() reads from USERPROFILE
+            os.environ['USERPROFILE'] = tmpdir
             clear_caches()
             try:
                 # absolute paths with the extension are not extended again
@@ -1297,4 +1313,8 @@ float f() { static const float SCAN = 2; return SCAN; }
                     os.environ.pop('HOME', None)
                 else:
                     os.environ['HOME'] = orig_home
+                if orig_profile is None:
+                    os.environ.pop('USERPROFILE', None)
+                else:
+                    os.environ['USERPROFILE'] = orig_profile
                 clear_caches()

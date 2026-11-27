@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 from kitty.constants import kitty_exe
 from kitty.rc.base import PayloadGetter, all_command_names, command_for_name
 
-from .base import BaseTest
+from .base import BaseTest, is_windows, skip_on_windows
 
 
 class Window:
@@ -41,6 +41,7 @@ class Boss:
 
 
 class TestRemoteControl(BaseTest):
+    @skip_on_windows('CPython has no AF_UNIX on Windows, the C listener in child-monitor.c handles stale sockets there')
     def test_listen_on_stale_socket(self):
         import socket
         from collections.abc import Callable
@@ -86,6 +87,44 @@ class TestRemoteControl(BaseTest):
             finally:
                 for close in closers:
                     close()
+
+    def test_listen_on_stale_socket_windows(self):
+        # The Windows counterpart of the test above: the C listener makes the
+        # sockets, as CPython has no AF_UNIX there, and Winsock closes them.
+        if not is_windows:
+            self.skipTest('Windows only')
+        import ctypes
+
+        from kitty.boss import listen_on
+        from kitty.fast_data_types import listen_on_unix_socket
+
+        closesocket = ctypes.WinDLL('ws2_32').closesocket  # type: ignore[attr-defined]
+        closesocket.argtypes = (ctypes.c_uint64,)
+        unlinked: list[str] = []
+        fake_atexit = cast(Any, Mock(unlink=unlinked.append))
+        with tempfile.TemporaryDirectory() as tdir:
+            path = os.path.join(tdir, 'sock')
+            # Closing a listener leaves its file behind, as a killed kitty would
+            closesocket(listen_on_unix_socket(path))
+            self.assertTrue(os.path.lexists(path))
+            fd, spec = listen_on(f'unix:{path}', fake_atexit)
+            try:
+                self.ae(spec, f'unix:{path}')
+                self.ae(unlinked, [path])
+                # The socket is now live, so a second listener must fail and not remove it
+                with self.assertRaisesRegex(OSError, 'Another process is already listening'):
+                    listen_on(f'unix:{path}', fake_atexit)
+                self.assertTrue(os.path.lexists(path))
+            finally:
+                closesocket(fd)
+            # A file that is not a socket must never be removed
+            fpath = os.path.join(tdir, 'file')
+            with open(fpath, 'w') as f:
+                f.write('x')
+            with self.assertRaisesRegex(OSError, 'not a socket'):
+                listen_on(f'unix:{fpath}', fake_atexit)
+            self.assertTrue(os.path.exists(fpath))
+            os.remove(path)
 
     def test_set_font_size_mapping(self):
         from kitty.boss import Boss as KittyBoss
@@ -348,7 +387,8 @@ class TestRemoteControl(BaseTest):
 
         command = command_for_name('set-background-image')
         buffers = command.stream_in_flight.buffers
-        with tempfile.NamedTemporaryFile(suffix='.png') as f:
+        # Not deleted on close, so that it can be opened again while open on Windows
+        with tempfile.NamedTemporaryFile(suffix='.png', delete_on_close=False) as f:
             f.write(b'\x89PNG\r\n\x1a\n' + b'x' * 2048)
             f.flush()
             calls = 0
@@ -718,6 +758,7 @@ os._exit(0)
 """
 
 
+@skip_on_windows('talks over AF_UNIX sockets, which CPython does not build on Windows')
 class TestTalkThread(BaseTest):
     def test_talk_thread_not_blocked_by_stalled_peer(self):
         p = subprocess.run([kitty_exe(), '+runpy', TALK_THREAD_STALLED_PEER], capture_output=True, text=True, timeout=30)

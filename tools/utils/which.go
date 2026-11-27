@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
-	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -36,12 +34,15 @@ func Which(cmd string, paths ...string) string {
 		}
 		paths = strings.Split(path, string(os.PathListSeparator))
 	}
+	names := exe_file_names(cmd)
 	for _, dir := range paths {
-		q := filepath.Join(dir, cmd)
-		if unix.Access(q, unix.X_OK) == nil {
-			s, err := os.Stat(q)
-			if err == nil && !s.IsDir() {
-				return q
+		for _, name := range names {
+			q := filepath.Join(dir, name)
+			if Access(q, AccessExec) == nil {
+				s, err := os.Stat(q)
+				if err == nil && !s.IsDir() {
+					return q
+				}
 			}
 		}
 

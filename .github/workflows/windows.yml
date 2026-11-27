@@ -1,0 +1,146 @@
+name: Windows
+
+# The native Windows port is built, tested and packaged here. Upstream's Linux
+# and macOS jobs stay in ci.yml.
+on:
+    push:
+        # Documentation cannot break the build, so do not spend a runner on it.
+        # Written out twice because GitHub Actions does not support YAML anchors.
+        paths-ignore:
+            - '**.md'
+            - '**.rst'
+            - 'docs/**'
+            - 'LICENSE'
+    pull_request:
+        paths-ignore:
+            - '**.md'
+            - '**.rst'
+            - 'docs/**'
+            - 'LICENSE'
+    workflow_dispatch:
+
+env:
+    # The Go code uses the simd package, see ci.yml
+    GOEXPERIMENT: simd
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        name: Windows build, test and package
+        runs-on: windows-latest
+        defaults:
+            run:
+                shell: msys2 {0}
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up MSYS2
+              uses: msys2/setup-msys2@v2
+              with:
+                  msystem: UCRT64
+                  update: true
+                  # The build needs the same toolchain and libraries the port is
+                  # developed against. The library list matches the DLL closure
+                  # make-dist.sh bundles into the install tree.
+                  install: >-
+                      base-devel
+                      mingw-w64-ucrt-x86_64-gcc
+                      mingw-w64-ucrt-x86_64-pkgconf
+                      mingw-w64-ucrt-x86_64-python
+                      mingw-w64-ucrt-x86_64-go
+                      mingw-w64-ucrt-x86_64-harfbuzz
+                      mingw-w64-ucrt-x86_64-fribidi
+                      mingw-w64-ucrt-x86_64-freetype
+                      mingw-w64-ucrt-x86_64-fontconfig
+                      mingw-w64-ucrt-x86_64-cairo
+                      mingw-w64-ucrt-x86_64-libpng
+                      mingw-w64-ucrt-x86_64-xxhash
+                      mingw-w64-ucrt-x86_64-openssl
+                      mingw-w64-ucrt-x86_64-ncurses
+                      mingw-w64-ucrt-x86_64-lcms2
+                      mingw-w64-ucrt-x86_64-ruff
+                      mingw-w64-ucrt-x86_64-glslang
+
+            - name: Lint
+              run: |
+                  set -euo pipefail
+                  export PATH="/ucrt64/bin:$PATH"
+                  # ruff runs the same everywhere, so this catches what it
+                  # caught on upstream's Linux runner. It comes from pacman
+                  # above because the mingw python ships without pip.
+                  ruff check .
+
+            - name: Fetch the bundled Nerd Font
+              run: |
+                  set -euo pipefail
+                  # setup.py copies Symbols Nerd Font Mono out of the system font
+                  # directories into fonts/, which is gitignored, and fails the
+                  # build when it cannot find it. A runner has no such font
+                  # installed, so fetch the archive upstream CI uses and put the
+                  # one file it wants in place. add_builtin_fonts skips when the
+                  # destination already exists.
+                  mkdir -p fonts /tmp/nerd
+                  curl -fsSL -o /tmp/nerd.tar.xz https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.tar.xz
+                  tar -xf /tmp/nerd.tar.xz -C /tmp/nerd
+                  find /tmp/nerd -name 'SymbolsNerdFontMono-Regular.ttf' -exec cp {} fonts/ \;
+                  test -f fonts/SymbolsNerdFontMono-Regular.ttf
+
+            - name: Fetch the Slang compiler
+              run: |
+                  set -euo pipefail
+                  # kitty writes its shaders in Slang and compiles them to GLSL
+                  # during the build, which glslangValidator then checks. Use the
+                  # slangc release upstream builds with, named in bypy/sources.json,
+                  # since an older one writes GLSL the checker rejects.
+                  version="$(grep -o '"slang [0-9.]*"' bypy/sources.json | tr -d '"' | cut -d' ' -f2)"
+                  # The prebuilt slangc runs in the build and its output ships in
+                  # the installer, so the download is pinned. When sources.json
+                  # moves to a new version this fails until both lines below are
+                  # updated, the hash from the release asset's sha256 digest.
+                  pinned_version=2026.14.1
+                  pinned_sha256=791fe8400fe3cabdaf054089e6f5bffa745fbf5912b5b85e2ee4dc78c6b9aff7
+                  if [ "$version" != "$pinned_version" ]; then
+                      echo "bypy/sources.json wants slang $version, but this step pins $pinned_version" >&2
+                      exit 1
+                  fi
+                  mkdir -p /tmp/slang
+                  curl -fsSL -o /tmp/slang.tar.gz "https://github.com/shader-slang/slang/releases/download/v${version}/slang-${version}-windows-x86_64.tar.gz"
+                  echo "$pinned_sha256  /tmp/slang.tar.gz" | sha256sum -c -
+                  tar -xzf /tmp/slang.tar.gz -C /tmp/slang
+                  test -x /tmp/slang/bin/slangc.exe
+                  echo "SLANGC=$(cygpath -m /tmp/slang/bin/slangc.exe)" >> "$GITHUB_ENV"
+
+            - name: Build
+              run: |
+                  set -euo pipefail
+                  # ucrt64 first on PATH: the compiler loads its own DLLs through
+                  # PATH and cc1 dies without it.
+                  export PATH="/ucrt64/bin:$PATH"
+                  PYTHONUTF8=1 python setup.py build --verbose
+
+            - name: Test
+              run: |
+                  export PATH="/ucrt64/bin:$PATH"
+                  ./packaging/windows/run-tests.sh
+
+            - name: Package
+              run: |
+                  set -euo pipefail
+                  export PATH="/ucrt64/bin:$PATH"
+                  export MINGW_ROOT=/ucrt64
+                  export PYVER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+                  ./packaging/windows/make-installer.sh
+
+            # Every run leaves the installer as a build artifact, which is how you
+            # get a build to try. Releases are made by hand: nothing here writes
+            # to one, so publishing a release does not trigger a build and no
+            # asset is attached without someone deciding to.
+            - name: Upload installer
+              uses: actions/upload-artifact@v4
+              with:
+                  name: kitty-setup
+                  path: dist/kitty-setup.exe
+                  if-no-files-found: error

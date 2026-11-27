@@ -9,8 +9,6 @@ import (
 	"slices"
 	"strings"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/kovidgoyal/kitty/tools/utils"
 )
 
@@ -20,6 +18,28 @@ type FileEntry struct {
 	Name, CompletionCandidate, Abspath string
 	Mode                               os.FileMode
 	IsDir, IsSymlink, IsEmptyDir       bool
+}
+
+// Windows accepts both / and \ in a path, and both turn up in practice: kitty's
+// own config is written with forward slashes and the shells used here produce
+// either. Recognising only os.PathSeparator meant a prefix such as ./t was read
+// as having no directory part at all, and completed nothing.
+
+func is_path_separator(c byte) bool {
+	return c == '/' || (os.PathSeparator != '/' && c == byte(os.PathSeparator))
+}
+
+func has_path_separator_suffix(s string) bool {
+	return s != "" && is_path_separator(s[len(s)-1])
+}
+
+func last_path_separator_index(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if is_path_separator(s[i]) {
+			return i
+		}
+	}
+	return -1
 }
 
 func CompleteFiles(prefix string, callback func(*FileEntry), cwd string) error {
@@ -36,7 +56,13 @@ func CompleteFiles(prefix string, callback func(*FileEntry), cwd string) error {
 	// relative prefixes are resolved against cwd, not the process working directory
 	location := utils.Expanduser(prefix)
 	if !filepath.IsAbs(location) {
-		location = filepath.Join(cwd, location)
+		if location != "" && os.IsPathSeparator(location[0]) {
+			// Rooted on the drive of cwd, as \Windows is on Windows, where a
+			// path is absolute only with its volume name.
+			location = filepath.VolumeName(cwd) + location
+		} else {
+			location = filepath.Join(cwd, location)
+		}
 	}
 	base_dir := ""
 	joinable_prefix := ""
@@ -57,11 +83,11 @@ func CompleteFiles(prefix string, callback func(*FileEntry), cwd string) error {
 		base_dir = cwd
 		joinable_prefix = ""
 	default:
-		if strings.HasSuffix(prefix, utils.Sep) {
+		if has_path_separator_suffix(prefix) {
 			base_dir = location
 			joinable_prefix = prefix
 		} else {
-			idx := strings.LastIndex(prefix, utils.Sep)
+			idx := last_path_separator_index(prefix)
 			if idx > -1 {
 				joinable_prefix = prefix[:idx+1]
 				base_dir = filepath.Dir(location)
@@ -122,7 +148,7 @@ func CompleteExecutablesInPath(prefix string, paths ...string) []string {
 					// A symlink to a directory has IsDir() false but still passes the X_OK
 					// check, since directories are executable in the access(2) sense.
 					p := filepath.Join(dir, e.Name())
-					if unix.Access(p, unix.X_OK) == nil && !is_dir_or_symlink_to_dir(e, p) {
+					if utils.Access(p, utils.AccessExec) == nil && !is_dir_or_symlink_to_dir(e, p) {
 						ans = append(ans, e.Name())
 					}
 				}
@@ -278,13 +304,13 @@ func CompleteExecutableFirstArg(completions *Completions, word string, arg_num i
 				entries, err := os.ReadDir(entry.Abspath)
 				if err == nil {
 					for _, x := range entries {
-						if x.IsDir() || unix.Access(filepath.Join(entry.Abspath, x.Name()), unix.X_OK) == nil {
+						if x.IsDir() || utils.Access(filepath.Join(entry.Abspath, x.Name()), utils.AccessExec) == nil {
 							mg.AddMatch(entry.CompletionCandidate)
 							break
 						}
 					}
 				}
-			} else if unix.Access(entry.Abspath, unix.X_OK) == nil {
+			} else if utils.Access(entry.Abspath, utils.AccessExec) == nil {
 				mg.AddMatch(entry.CompletionCandidate)
 			}
 		}, "")

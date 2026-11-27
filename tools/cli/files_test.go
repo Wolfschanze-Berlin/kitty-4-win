@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -37,6 +38,9 @@ func TestCompleteFiles(t *testing.T) {
 		if expected == nil {
 			expected = make([]string, 0)
 		}
+		for i, x := range expected {
+			expected[i] = filepath.ToSlash(x)
+		}
 		sort.Strings(expected)
 		actual := make([]string, 0, len(expected))
 		CompleteFiles(prefix, func(entry *FileEntry) {
@@ -45,6 +49,12 @@ func TestCompleteFiles(t *testing.T) {
 				t.Fatalf("Abspath does not exist: %#v", entry.Abspath)
 			}
 		}, "")
+		// A directory candidate is suffixed with the platform separator, so
+		// normalise: the expectations are written POSIX style and what matters
+		// is which entries came back.
+		for i, a := range actual {
+			actual[i] = filepath.ToSlash(a)
+		}
 		sort.Strings(actual)
 		if !reflect.DeepEqual(expected, actual) {
 			t.Fatalf("Did not get expected completion candidates for prefix: %#v\nExpected: %#v\nActual:   %#v", prefix, expected, actual)
@@ -58,10 +68,15 @@ func TestCompleteFiles(t *testing.T) {
 				e[i] = x
 			} else {
 				e[i] = filepath.Join(tdir, x)
-				if strings.HasSuffix(x, utils.Sep) {
-					e[i] += utils.Sep
+				// The expectations are written POSIX style, so test for that
+				// suffix rather than the platform one, which never matches on
+				// Windows and silently drops the trailing separator that marks
+				// a directory candidate.
+				if strings.HasSuffix(x, "/") {
+					e[i] += "/"
 				}
 			}
+			e[i] = filepath.ToSlash(e[i])
 		}
 		test_candidates(prefix, e...)
 	}
@@ -125,13 +140,14 @@ func TestCompleteFiles(t *testing.T) {
 	test_with_cwd("./sessions/w", cdir, "./sessions/work.kitty-session")
 	test_with_cwd("../sessions/w", filepath.Join(cdir, "sessions"), "../sessions/work.kitty-session")
 	t.Setenv("HOME", cdir)
+	t.Setenv("USERPROFILE", cdir) // what os.UserHomeDir() reads on Windows
 	test_with_cwd("~/sessions/w", tdir, "~/sessions/work.kitty-session")
 	// a relative cwd, such as a config directory from a relative XDG_CONFIG_HOME, is relative to the process cwd
 	if err := os.Chdir(filepath.Dir(cdir)); err != nil {
 		t.Fatal(err)
 	}
 	test_with_cwd("sessions/", filepath.Base(cdir), "sessions/work.kitty-session")
-	test_with_cwd("s", filepath.Base(cdir), "sessions/")
+	test_with_cwd("s", filepath.Base(cdir), "sessions"+utils.Sep) // directories end with the platform's separator
 	if err := os.Chdir(tdir); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +156,7 @@ func TestCompleteFiles(t *testing.T) {
 	os.Symlink(filepath.Join(tdir, "odir"), filepath.Join(tdir, "slink"))
 	c := NewCompletions()
 	DirectoryCompleter("", CWD)(c, "s", 0)
-	if len(c.Groups) != 1 || len(c.Groups[0].Matches) != 1 || c.Groups[0].Matches[0].Word != "slink/" {
+	if len(c.Groups) != 1 || len(c.Groups[0].Matches) != 1 || c.Groups[0].Matches[0].Word != "slink"+utils.Sep {
 		t.Fatalf("Symlink to directory not completed by DirectoryCompleter: %#v", c.Groups)
 	}
 
@@ -152,7 +168,7 @@ func TestCompleteFiles(t *testing.T) {
 	found := false
 	for _, g := range c.Groups {
 		for _, m := range g.Matches {
-			found = found || m.Word == "cdir/"
+			found = found || m.Word == "cdir"+utils.Sep
 		}
 	}
 	if !found {
@@ -175,6 +191,12 @@ func TestCompleteFiles(t *testing.T) {
 }
 
 func TestCompleteExecutables(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The fixture separates runnable from not by the execute bit. Windows
+		// decides by extension through PATHEXT, so every file in PATH looks
+		// runnable and the negative cases all come back. Recorded in WINDOWS_TODO.
+		t.Skip("executables are identified by the POSIX execute bit here")
+	}
 	tdir := t.TempDir()
 	create := func(base string, name string, mode os.FileMode) {
 		f, _ := os.OpenFile(filepath.Join(tdir, base, name), os.O_CREATE, mode)

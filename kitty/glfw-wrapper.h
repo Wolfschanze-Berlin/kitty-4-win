@@ -2445,6 +2445,14 @@ typedef void* (*glfwGetWaylandWindow_func)(GLFWwindow*);
 GFW_EXTERN glfwGetWaylandWindow_func glfwGetWaylandWindow_impl;
 #define glfwGetWaylandWindow glfwGetWaylandWindow_impl
 
+typedef void* (*glfwGetWin32Window_func)(GLFWwindow*);
+GFW_EXTERN glfwGetWin32Window_func glfwGetWin32Window_impl;
+#define glfwGetWin32Window glfwGetWin32Window_impl
+
+typedef void* (*glfwGetWin32Presenter_func)(GLFWwindow*);
+GFW_EXTERN glfwGetWin32Presenter_func glfwGetWin32Presenter_impl;
+#define glfwGetWin32Presenter glfwGetWin32Presenter_impl
+
 typedef void (*glfwSetPrimarySelectionString_func)(GLFWwindow*, const char*);
 GFW_EXTERN glfwSetPrimarySelectionString_func glfwSetPrimarySelectionString_impl;
 #define glfwSetPrimarySelectionString glfwSetPrimarySelectionString_impl

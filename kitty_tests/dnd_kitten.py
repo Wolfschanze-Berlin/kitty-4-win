@@ -34,7 +34,7 @@ from kitty.fast_data_types import (
 )
 from kitty.utils import as_file_url
 
-from .base import PTY, BaseTest
+from .base import PTY, BaseTest, skip_on_windows
 from .dnd import WriteCapture
 
 
@@ -67,6 +67,7 @@ def create_fs(base, include_toplevel_working_symlink=True):
     os.symlink('../moose', join('d1', 'sd', 'ssd', 's11'))
 
 
+@skip_on_windows('drag and drop is not built here, kitty/dnd.c is replaced by wincompat/dnd_stub.c')
 class TestDnDKitten(BaseTest):
     def assert_trees_equal(self, a: str, b: str, ignored='.dnd-kitten-drop-*'):
         a_name = os.path.relpath(a, self.test_dir)

@@ -421,6 +421,10 @@ typedef struct {
     uint64_t bidi_layout_generation; // bumped where rows move or the inputs of their layout change, which reused maps would miss
     bool bidi_records_writes;        // see screen_bidi_records_writes_changed()
     bool bidi_history_bits_stale;    // see bidi_note_line_from_history()
+#ifdef _WIN32
+    // When the program last hid the cursor, see collect_cursor_info()
+    monotonic_t cursor_hidden_at;
+#endif
 } Screen;
 
 // Text is drawn by the recording loop while bidi mode is on or the active buffer has a stamp, so that one load picks the loop

@@ -13,7 +13,7 @@ from kitty.fast_data_types import Screen
 from kitty.os_window_size import WindowSize, WindowSizes, initial_window_size_func
 from kitty.session import get_os_window_sizing_data, parse_session, save_as_session
 
-from .base import BaseTest, parse_bytes
+from .base import BaseTest, is_windows, parse_bytes, skip_on_windows
 
 
 class TestSessions(BaseTest):
@@ -240,7 +240,8 @@ class TestSessions(BaseTest):
                         self.ae(spec.opts.window_title, literal)
                         self.ae(spec.opts.var, ['name=' + literal])
                         self.ae(resolve_custom_file(spec.opts.logo), logo_path)
-                        self.ae([resolve_custom_file(x) for x in spec.opts.watcher], ['/watchers/w $KITTY_SESSION_TEST.py'])
+                        # Windows puts a path rooted without a drive on a drive
+                        self.ae([os.path.splitdrive(resolve_custom_file(x))[1] for x in spec.opts.watcher], ['/watchers/w $KITTY_SESSION_TEST.py'])
                         # Tab._startup() launches session windows without expanding the cwd again
                         child = Child(spec.args, spec.opts.cwd, env=get_env(spec.opts), expand_cwd=False)
                         self.ae((child.cwd, child.env['SESSION_VALUE']), (str(root / name), literal))
@@ -264,6 +265,8 @@ class TestSessions(BaseTest):
             for w in tab.windows:
                 assert isinstance(w.launch_spec, LaunchSpec)
                 cwds.append(w.launch_spec.opts.cwd)
+            # Windows puts a path rooted without a drive on the current drive
+            cwds[-1] = os.path.splitdrive(cwds[-1])[1]
             self.ae(cwds, [tab.cwd, str(base / 'winexpanded'), os.path.expanduser('~'), 'current', '/abs$KITTY_SESSION_TEST'])
             # Other callers still get their cwd expanded by Child
             self.ae(Child(['/bin/true'], str(base / '$KITTY_SESSION_TEST')).cwd, str(base / 'expanded'))
@@ -304,6 +307,7 @@ class TestSessions(BaseTest):
             os.mkdir(d)
             self.ae(child_kwargs(False, cmd=[d]), (d, False))
 
+    @skip_on_windows('expects a POSIX cwd such as /home to survive unchanged, Windows makes it C:/home')
     def test_save_as_session_line_injection(self) -> None:
         # Values such as the cwd reported via OSC 7 or user vars are under the
         # control of programs running in the window and must not be able to
@@ -466,6 +470,20 @@ class TestSessions(BaseTest):
             with self.subTest(unsafe=unsafe):
                 self.ae(s(f'a{unsafe}b'), expected)
 
+    def test_restore_after_logout_refused_on_windows(self) -> None:
+        # The logout monitor is a D-Bus portal with no Windows counterpart, so
+        # turning the option on must not stop kitty from starting
+        if not is_windows:
+            self.skipTest('the refusal is Windows only')
+        from kitty import boss
+
+        self.set_options({'restore_session_after_logout': True})
+        fake_boss = cast(boss.Boss, SimpleNamespace(on_desktop_session_state_changed=lambda state: None))
+        with patch.object(boss, 'log_error') as log_error:
+            boss.Boss.monitor_desktop_session_if_needed(fake_boss)
+        self.assertIn('not supported on Windows', log_error.call_args[0][0])
+
+    @skip_on_windows('checks POSIX permission bits on the saved snapshots, which Windows does not keep')
     def test_logout_snapshots(self) -> None:
         from .crypto import is_rlimit_memlock_too_low
 

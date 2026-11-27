@@ -2742,10 +2742,10 @@ opt(
     option_type='to_bool',
     ctype='bool',
     long_text="""
-Allow changing of the :opt:`background_opacity` dynamically, using either
-keyboard shortcuts (:sc:`increase_background_opacity` and
-:sc:`decrease_background_opacity`) or the remote control facility. Changing
-this option by reloading the config is not supported.
+Allow changing of the :opt:`background_opacity` dynamically, using either the
+:ac:`set_background_opacity` action, which has no default shortcut, or the
+remote control facility. Changing this option by reloading the config is not
+supported.
 """,
 )
 
@@ -3985,6 +3985,11 @@ map(
 )
 
 map(
+    'Select all',
+    'select_all --allow-fallback=shifted,ascii kitty_mod+a select_all',
+)
+
+map(
     'Paste from clipboard',
     'paste_from_clipboard --allow-fallback=shifted,ascii kitty_mod+v paste_from_clipboard',
 )
@@ -4756,25 +4761,8 @@ Open the kitty shell in a new :code:`window` / :code:`tab` / :code:`overlay` /
 """,
 )
 
-map(
-    'Increase background opacity',
-    'increase_background_opacity --allow-fallback=shifted,ascii kitty_mod+a>m set_background_opacity +0.1',
-)
-
-map(
-    'Decrease background opacity',
-    'decrease_background_opacity --allow-fallback=shifted,ascii kitty_mod+a>l set_background_opacity -0.1',
-)
-
-map(
-    'Make background fully opaque',
-    'full_background_opacity --allow-fallback=shifted,ascii kitty_mod+a>1 set_background_opacity 1',
-)
-
-map(
-    'Reset background opacity',
-    'reset_background_opacity --allow-fallback=shifted,ascii kitty_mod+a>d set_background_opacity default',
-)
+# Background-opacity chords were led by kitty_mod+a, which is now Select all. The
+# set_background_opacity action is still available to bind by hand.
 
 map(
     'Reset the terminal',

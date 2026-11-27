@@ -157,6 +157,10 @@ discard_pending_gl_errors(void) {
 
 static void
 check_for_gl_error(void UNUSED *ret, const char *name, GLADapiproc UNUSED funcptr, int UNUSED len_args, ...) {
+    // Objects of a closed OS Window are freed after its surface is destroyed,
+    // with no context current. The calls do nothing then, but on WGL
+    // glGetError() reports GL_INVALID_OPERATION for them.
+    if (the_driver && !the_driver->current_surface) return;
 #define f(msg)                                                               \
     fatal(the_driver, "OpenGL error: %s (calling function: %s)", msg, name); \
     break;
@@ -223,6 +227,11 @@ static EnvOverride software_env[] = {
 };
 static bool software_env_applied = false;
 
+#ifdef _WIN32
+// Never reached as the software environment is not applied on Windows, see connect_to_display()
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#define unsetenv(name) _putenv_s(name, "")
+#endif
 static void
 restore_software_env(Driver *d) {
     if (!software_env_applied) return;
@@ -237,7 +246,7 @@ restore_software_env(Driver *d) {
     software_env_applied = false;
 }
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 static bool
 apply_software_env(Driver *d) {
     if (software_env_applied) return true;
@@ -1181,11 +1190,18 @@ ensure_platform(Driver *d, GPUPlatform type) {
 #ifdef __APPLE__
         case GPU_PLATFORM_COCOA: p = nsgl_platform(&platform_host); break;
         case GPU_PLATFORM_X11:
-        case GPU_PLATFORM_WAYLAND: break;
+        case GPU_PLATFORM_WAYLAND:
+        case GPU_PLATFORM_WIN32: break;
+#elif defined(_WIN32)
+        case GPU_PLATFORM_WIN32: p = wgl_platform(&platform_host); break;
+        case GPU_PLATFORM_X11:
+        case GPU_PLATFORM_WAYLAND:
+        case GPU_PLATFORM_COCOA: break;
 #else
         case GPU_PLATFORM_X11: p = glx_platform(&platform_host); break;
         case GPU_PLATFORM_WAYLAND: p = egl_platform(&platform_host); break;
-        case GPU_PLATFORM_COCOA: break;
+        case GPU_PLATFORM_COCOA:
+        case GPU_PLATFORM_WIN32: break;
 #endif
     }
     if (!p) {
@@ -1207,6 +1223,9 @@ connect_to_display(void *driver, const GPUNativeWindow *display) {
     if (d->params.renderer == GPU_RENDERER_SOFTWARE) {
 #ifdef __APPLE__
         set_error(d, "Software rendering with OpenGL is not supported on macOS");
+        return false;
+#elif defined(_WIN32)
+        set_error(d, "Software rendering with OpenGL is not supported on Windows");
         return false;
 #else
         return apply_software_env(d);

@@ -53,7 +53,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KITTY_GPU_API_VERSION 7u
+#define KITTY_GPU_API_VERSION 8u
 #define KITTY_GPU_DRIVER_ENTRY_POINT "kitty_gpu_driver_load"
 #define GPU_NULL_HANDLE ((uint64_t)0)
 
@@ -128,16 +128,35 @@ typedef enum {
     GPU_PLATFORM_X11 = 1,
     GPU_PLATFORM_WAYLAND,
     GPU_PLATFORM_COCOA,
+    GPU_PLATFORM_WIN32,
 } GPUPlatform;
+
+// Win32: lets the windowing system take part in presenting a window, for
+// windows that have no redirection surface and reach the screen through a
+// composition swapchain of their own. The driver renders into the window
+// framebuffer as usual and calls these with the context of the surface
+// current. Owned by the windowing system, valid for the lifetime of the
+// window. Drivers that use it leave pacing to present() and present with a
+// swap interval of zero.
+typedef struct GPUWin32Presenter {
+    // Present the contents of the window framebuffer, after waiting for the
+    // compositor if swap_interval is positive. Returns false if the window
+    // has to be presented the normal way, with SwapBuffers().
+    bool (*present)(struct GPUWin32Presenter *self, int swap_interval);
+    // Release the OpenGL objects present() created, called before the context
+    // of the surface is destroyed or recreated
+    void (*release)(struct GPUWin32Presenter *self);
+} GPUWin32Presenter;
 
 // A native window, or just the native display connection when used with
 // choose_native_visual()
 typedef struct GPUNativeWindow {
     GPUPlatform platform;
-    void *display;       // X11: Display*, Wayland: struct wl_display*, Cocoa: unused
-    int screen;          // X11: the screen number, negative for the default screen, unused on other platforms
-    uint64_t x11_window; // X11: the Window, unused on other platforms
-    void *handle;        // Wayland: struct wl_surface*, Cocoa: the NSView* to render into, unused on X11
+    void *display;                      // X11: Display*, Wayland: struct wl_display*, Cocoa and Win32: unused
+    int screen;                         // X11: the screen number, negative for the default screen, unused on other platforms
+    uint64_t x11_window;                // X11: the Window, unused on other platforms
+    void *handle;                       // Wayland: struct wl_surface*, Cocoa: the NSView* to render into, Win32: the HWND, unused on X11
+    GPUWin32Presenter *win32_presenter; // Win32: optional, see GPUWin32Presenter, unused on other platforms
 } GPUNativeWindow;
 
 typedef struct GPUSurfaceConfig {

@@ -9,9 +9,10 @@ from kitty.constants import is_macos, kitten_exe
 from kitty.fast_data_types import shm_unlink
 from kitty.shm import SharedMemory
 
-from .base import BaseTest
+from .base import BaseTest, skip_on_windows
 
 
+@skip_on_windows('POSIX shared memory, which Windows has no equivalent of')
 class SHMTest(BaseTest):
     def test_shm_with_kitten(self):
         data = os.urandom(333)

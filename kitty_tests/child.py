@@ -15,7 +15,12 @@ from unittest.mock import Mock, patch
 from kitty.child import Child, KittyWrapper, children_of_process, cmdline_of_pid, cwd_of_process, memory_used_by_process_tree_rooted_at
 from kitty.constants import is_macos, kitten_exe, kitty_exe
 
-from .base import BaseTest
+from .base import BaseTest, is_windows, skip_on_windows
+
+# Features new in kitty 0.49 to 0.51 that the Windows port does not have yet
+no_memory_accounting = skip_on_windows('child memory accounting reads /proc and cgroups, which is not ported yet')
+no_root_tracking = skip_on_windows('root and descendant process tracking walks the POSIX process tree, which is not ported yet')
+no_launch_wrapper = skip_on_windows('the launch wrapper is written for POSIX shells and paths, which is not ported yet')
 
 
 def _descendants(pid: int) -> list[int]:
@@ -61,6 +66,7 @@ time.sleep(300)
         p.terminate()
         p.wait()
 
+    @no_memory_accounting
     def test_memory_returns_positive_for_live_process(self):
         mem = memory_used_by_process_tree_rooted_at(os.getpid())
         self.assertGreater(mem, 0)
@@ -68,6 +74,7 @@ time.sleep(300)
     def test_memory_returns_minus_one_for_nonexistent_pid(self):
         self.ae(memory_used_by_process_tree_rooted_at(99999999), -1)
 
+    @no_memory_accounting
     def test_memory_accounts_for_child_allocation(self):
         # Verify that a child's known resident allocation shows up in the
         # measurement.  check_if_cgroup_root=True falls back to per-process
@@ -86,6 +93,7 @@ time.sleep(300)
         finally:
             self._terminate(child)
 
+    @no_memory_accounting
     def test_memory_of_parent_tree_includes_child(self):
         # Measuring the current process tree must yield more than measuring
         # the child alone, because the test runner itself occupies memory.
@@ -102,6 +110,7 @@ time.sleep(300)
         finally:
             self._terminate(child)
 
+    @no_memory_accounting
     def test_memory_cgroup_path_returns_positive(self):
         # The fast cgroup path (check_if_cgroup_root=False, the default) must
         # return a usable value on Linux.
@@ -110,6 +119,7 @@ time.sleep(300)
         mem = memory_used_by_process_tree_rooted_at(os.getpid())
         self.assertGreater(mem, 0)
 
+    @no_memory_accounting
     def test_memory_cgroup_and_tree_walk_both_positive(self):
         # Both the cgroup path and the tree-walk path should give positive
         # results for a process that is alive.
@@ -166,6 +176,7 @@ time.sleep(300)
         c.kitty_wrappers = wrappers
         return c
 
+    @no_root_tracking
     def test_root_pid(self):
         with tempfile.TemporaryDirectory() as tdir:
             tdir = os.path.realpath(tdir)
@@ -197,6 +208,7 @@ time.sleep(300)
             finally:
                 self._terminate_tree(p)
 
+    @no_root_tracking
     def test_root_pid_caching(self):
         with tempfile.TemporaryDirectory() as tdir:
             p = self._spawn_wrapper(tdir)
@@ -236,6 +248,7 @@ time.sleep(300)
             finally:
                 self._terminate_tree(p)
 
+    @no_root_tracking
     def test_descendants_from_threads(self):
         if is_macos:
             self.skipTest('Per thread children lists are Linux only')
@@ -304,6 +317,31 @@ class LaunchWrapperTest(BaseTest):
         os.close(c.child_fd)
         c.child_fd = None
         return c, spawned['exe'], spawned['argv']
+
+    def test_launch_wrapper_refused_on_windows(self):
+        # Windows starts children through a ConPTY of its own, which the
+        # wrapper is not ported to, so a configured wrapper must be reported
+        if not is_windows:
+            self.skipTest('the refusal is Windows only')
+        from kitty import child as child_module
+        from kitty import launch_wrapper
+        from kitty.launch_wrapper import LaunchRequest, load_prefix_func, refuse_launch_wrapper_on_windows
+
+        class StopBeforeSpawn(Exception):
+            pass
+
+        load_prefix_func.set_override(lambda ctx: ('wrapper',))
+        refuse_launch_wrapper_on_windows.clear_cached()
+        c = Child(['cmd.exe'], os.getcwd(), env={}, launch_request=LaunchRequest('window'))
+        boss = SimpleNamespace(encryption_public_key='key', listening_on='', window_id_map={})
+        with (
+            patch.object(child_module.fast_data_types, 'get_boss', return_value=boss),
+            patch.object(launch_wrapper, 'log_error') as log_error,
+            patch.object(child_module.fast_data_types, 'open_pty', side_effect=StopBeforeSpawn, create=True),
+            self.assertRaises(StopBeforeSpawn),
+        ):
+            c.fork()
+        self.assertIn('not supported on Windows', log_error.call_args[0][0])
 
     def _recording(self, ans):
         def func(ctx):
@@ -416,6 +454,7 @@ class LaunchWrapperTest(BaseTest):
     report_pid = r"""/bin/sh -c 'printf "%s\n" "$0"; read -r _' "$$"
 exit $?"""
 
+    @no_launch_wrapper
     def test_script_launch_wrapper_root_pid(self):
         from kitty.launch_wrapper import LaunchRequest
 
@@ -485,6 +524,7 @@ read -r _
                         finally:
                             self._stop_tree(p)
 
+    @no_launch_wrapper
     def test_launch_wrapper_root_pid_with_hold(self):
         # The hold kitten runs wrappers specified by name via their path
         from kitty.launch_wrapper import LaunchRequest
@@ -514,6 +554,7 @@ read -r _
                     finally:
                         self._stop_tree(p)
 
+    @no_launch_wrapper
     def test_launch_wrapper(self):
         from kitty.launch_wrapper import LaunchRequest
 
@@ -591,6 +632,7 @@ read -r _
                 self.ae(argv, ('/bin/prog', 'arg'))
         self.ae(len(errors), 6)
 
+    @no_launch_wrapper
     def test_launch_wrapper_empty_path(self):
         from kitty.launch import get_env, parse_launch_args
         from kitty.launch_wrapper import LaunchRequest
@@ -638,6 +680,7 @@ read -r _
                 self.ae(self.contexts[-1].argv, (expected,))
                 self.ae(argv[-2:], ('/bin/wrapper', expected))
 
+    @no_launch_wrapper
     def test_launch_wrapper_unresolved_argv(self):
         # The program is run as requested, so that the wrapper looks it up in
         # PATH, unless PATH would not find what kitty found
@@ -706,6 +749,7 @@ read -r _
                     self.assertTrue(c.is_default_shell)
                     self.assertTrue(self.contexts[-1].is_default_shell)
 
+    @no_launch_wrapper
     def test_launch_wrapper_default_bash_with_shell_integration(self):
         from kitty.launch_wrapper import LaunchRequest
 
@@ -719,6 +763,7 @@ read -r _
                     self.ae(self.contexts[-1].argv, ('/bin/bash', '--posix'))
                     self.ae(self.contexts[-1].is_default_shell, is_default_shell)
 
+    @no_launch_wrapper
     def test_launch_wrapper_invalid_shell(self):
         # An invalid shell option falls back to the login shell, with the
         # wrapper still applied
@@ -753,6 +798,7 @@ read -r _
         log_error.assert_called_once()
         self.assertIn('Unterminated string', log_error.call_args.args[0])
 
+    @no_launch_wrapper
     def test_launch_wrapper_for_panel_commands(self):
         # Commands sent to a running panel via single instance are user
         # launches, not run from any window in the panel

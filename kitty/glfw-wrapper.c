@@ -503,6 +503,12 @@ load_glfw(const char* path) {
     *(void **) (&glfwGetWaylandWindow_impl) = dlsym(handle, "glfwGetWaylandWindow");
     if (glfwGetWaylandWindow_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwGetWin32Window_impl) = dlsym(handle, "glfwGetWin32Window");
+    if (glfwGetWin32Window_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwGetWin32Presenter_impl) = dlsym(handle, "glfwGetWin32Presenter");
+    if (glfwGetWin32Presenter_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwSetPrimarySelectionString_impl) = dlsym(handle, "glfwSetPrimarySelectionString");
     if (glfwSetPrimarySelectionString_impl == NULL) dlerror(); // clear error indicator
 

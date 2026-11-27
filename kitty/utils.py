@@ -28,6 +28,7 @@ from .constants import (
     config_dir_files_ignored,
     is_macos,
     is_wayland,
+    is_windows,
     kitten_exe,
     runtime_dir,
     shell_path,
@@ -181,6 +182,14 @@ def read_screen_size(fd: int = -1) -> ScreenSize:
     buf = array.array('H', [0, 0, 0, 0])
     if fd < 0:
         fd = sys.stdout.fileno()
+    if is_windows:
+        # No TIOCGWINSZ on Windows. The console reports its size in cells only,
+        # so the pixel dimensions stay zero, which is what callers such as the
+        # help formatter already tolerate (they read cols).
+        import shutil
+
+        size = shutil.get_terminal_size()
+        return ScreenSize(size.lines, size.columns, 0, 0, 0, 0)
     fcntl.ioctl(fd, termios.TIOCGWINSZ, cast(bytearray, buf))
     rows, cols, width, height = tuple(buf)
     cell_width, cell_height = width // (cols or 1), height // (rows or 1)
@@ -241,7 +250,17 @@ def command_for_open(program: str | list[str] = 'default') -> list[str]:
 
         program = to_cmdline(program)
     if program == ['default']:
-        cmd = ['open'] if is_macos else ['xdg-open']
+        if is_macos:
+            cmd = ['open']
+        elif is_windows:
+            # There is no xdg-open here. rundll32 hands the URL to the shell's
+            # protocol handler, the same route ShellExecute takes, so it opens
+            # in whatever the user set as default. Unlike `cmd /c start` it is a
+            # direct exec, so an & in a query string stays part of the URL
+            # instead of being read as a command separator.
+            cmd = ['rundll32.exe', 'url.dll,FileProtocolHandler']
+        else:
+            cmd = ['xdg-open']
     else:
         cmd = program
     return cmd
@@ -262,6 +281,21 @@ def open_cmd(
     if extra_env:
         env = os.environ.copy()
         env.update(extra_env)
+    if is_windows:
+        # preexec_fn raises ValueError on Windows before the process is even
+        # created, so opening anything failed here regardless of the command.
+        # There are no inherited signal handlers to reset, so there is nothing
+        # for it to do. CREATE_NO_WINDOW keeps a console based handler from
+        # flashing a window on its way past.
+        return subprocess.Popen(
+            tuple(cmd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=cwd or None,
+            env=env,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
     return subprocess.Popen(
         tuple(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=cwd or None, preexec_fn=clear_handled_signals, env=env
     )
@@ -293,7 +327,7 @@ def end_startup_notification_x11(ctx: 'StartupCtx') -> None:
 
 
 def init_startup_notification(window_handle: int | None, startup_id: str | None = None) -> Optional['StartupCtx']:
-    if is_macos or is_wayland():
+    if is_macos or is_windows or is_wayland():
         return None
     if window_handle is None:
         log_error('Could not perform startup notification as window handle not present')
@@ -318,7 +352,7 @@ def init_startup_notification(window_handle: int | None, startup_id: str | None 
 def end_startup_notification(ctx: Optional['StartupCtx']) -> None:
     if not ctx:
         return
-    if is_macos or is_wayland():
+    if is_macos or is_windows or is_wayland():
         return
     try:
         end_startup_notification_x11(ctx)
@@ -388,6 +422,11 @@ def parse_address_spec(spec: str) -> tuple[AddressFamily, tuple[str, int] | str,
     socket_path = None
     address: str | tuple[str, int] = ''
     if protocol == 'unix':
+        if not hasattr(socket, 'AF_UNIX'):
+            # Windows has had AF_UNIX since build 17063, but CPython does not
+            # build it (python/cpython#77589), so the socket cannot be created
+            # even though the platform would carry it. tcp: needs none of this.
+            raise ValueError(f'Cannot listen on {spec}: this Python was built without socket.AF_UNIX. Use a tcp: address instead, for example tcp:127.0.0.1:0')
         family = socket.AF_UNIX
         address = rest
         if address.startswith('@') and len(address) > 1:
@@ -565,6 +604,37 @@ def get_editor_from_env(env: Mapping[str, str]) -> str | None:
     return None
 
 
+def editor_next_to_shell(opts: Options | None, candidates: tuple[str | None, ...]) -> str:
+    # On Windows kitty's PATH does not include the MSYS2/Cygwin bin dir, so which()
+    # cannot find nano/vim there. The configured shell (e.g.
+    # C:/msys64/usr/bin/zsh.exe) lives in that bin dir, so look for an editor next
+    # to it.
+    shell = (opts.shell if opts is not None else '') or ''
+    if not shell or shell == '.':
+        with suppress(Exception):
+            shell = get_options().shell
+    if not shell or shell == '.':
+        return ''
+    try:
+        shell_exe = next(iter(shlex_split(shell)))
+    except Exception:
+        return ''
+    # Use forward slashes so the path survives the shlex_split the caller applies.
+    bindir = os.path.dirname(shell_exe).replace('\\', '/').rstrip('/')
+    if not bindir:
+        return ''
+    for cand in candidates:
+        if not cand:
+            continue
+        with suppress(Exception):
+            name = os.path.basename(next(iter(shlex_split(cand))))
+            for ext in ('.exe', ''):
+                p = f'{bindir}/{name}{ext}'
+                if os.path.isfile(p):
+                    return p
+    return ''
+
+
 def get_editor_from_env_vars(opts: Options | None = None) -> list[str]:
     from .child import default_env
 
@@ -577,7 +647,12 @@ def get_editor_from_env_vars(opts: Options | None = None) -> list[str]:
         if ans and which(next(shlex_split(ans)), only_system=True):
             break
     else:
-        ans = 'vim'
+        ans = ''
+        if is_windows:
+            # Notepad ships with every Windows install, where vim rarely is
+            ans = editor_next_to_shell(opts, (editor, 'nano', 'micro', 'vim', 'nvim', 'vi', 'hx', 'kak', 'vis')) or 'notepad.exe'
+        if not ans:
+            ans = 'vim'
     return list(shlex_split(ans))
 
 
@@ -603,6 +678,8 @@ def get_editor(opts: Options | None = None, path_to_edit: str = '', line_number:
                 ans.append('--goto')
             elif eq in ('subl', 'subl.exe', 'sublime_text', 'sublime_text.exe', 'zed', 'zed.exe', 'zeditor'):
                 path_to_edit += f':{line_number}'
+            elif is_windows and eq in ('notepad', 'notepad.exe'):
+                pass  # Notepad takes no line, and would read +N as part of the file name
             else:
                 ans.append(f'+{line_number}')
         ans.append(path_to_edit)
@@ -619,8 +696,24 @@ def edit_file(path: str = '') -> NoReturn:
     os.execlp(editor[0], *editor)
 
 
+def reaches_another_machine_or_a_device(path: str) -> bool:
+    """Whether opening path on Windows, or even resolving it, could contact
+    another machine or open a device. A UNC path such as \\\\host\\share, and the
+    \\\\?\\, \\\\.\\ and \\??\\ forms, make Windows sign in to the host with the user's
+    login hash, so a program in a kitty window naming one in an image escape
+    code would send that hash wherever it liked. Names such as COM1 and PRN
+    open a device, which for a serial port resets the board on it."""
+    if not is_windows:
+        return False
+    if path.replace('/', '\\').startswith('\\??\\'):
+        return True
+    # abspath is GetFullPathNameW, which works on the text alone and turns a
+    # device name into \\.\COM1 exactly as opening it would
+    return os.path.abspath(path).replace('/', '\\').startswith('\\\\')
+
+
 def is_path_in_temp_dir(path: str) -> bool:
-    if not path:
+    if not path or reaches_another_machine_or_a_device(path):
         return False
 
     def abspath(x: str | None) -> str:
@@ -632,10 +725,30 @@ def is_path_in_temp_dir(path: str) -> bool:
 
     path = abspath(path)
     candidates = frozenset(map(abspath, ('/tmp', '/dev/shm', os.environ.get('TMPDIR', None), tempfile.gettempdir())))
+    if is_windows:
+        # A folder boundary, or C:\tmp would also match C:\tmp-projects
+        def norm(x: str) -> str:
+            return os.path.normcase(x).replace('/', '\\').rstrip('\\')
+
+        p = norm(path)
+        return any(q and (p == norm(q) or p.startswith(norm(q) + '\\')) for q in candidates)
     for q in candidates:
         if q and path.startswith(q):
             return True
     return False
+
+
+def may_delete_temp_graphics_file(path: str) -> bool:
+    """Whether the cleanup of a temporary file a graphics command sent may
+    delete path. kitty deletes such a file only when its name carries
+    tty-graphics-protocol. Windows resolves .. by text, through folders that
+    need not exist, so %TEMP%\\tty-graphics-protocol\\..\\report.docx carries
+    the name yet means report.docx, and there the resolved file itself must."""
+    if not is_path_in_temp_dir(path):
+        return False
+    if is_windows:
+        return 'tty-graphics-protocol' in os.path.basename(os.path.realpath(path))
+    return True
 
 
 def is_ok_to_read_image_path(path: str) -> bool:
@@ -645,7 +758,7 @@ def is_ok_to_read_image_path(path: str) -> bool:
     can have side effects and the success or failure of the open leaks the
     existence of the file to the, possibly remote or sandboxed, client.
     """
-    if not path:
+    if not path or reaches_another_machine_or_a_device(path):
         return False
     path = os.path.abspath(os.path.realpath(path))
     parts = path.split(os.sep)[1:]
@@ -840,6 +953,11 @@ def is_same_executable(a: str, b: str) -> bool:
 
 @lru_cache(4)
 def read_resolved_shell_environment(shell: tuple[str, ...]) -> MappingProxyType[str, str]:
+    if is_windows:
+        # Capturing the interactive shell environment needs a pty (openpty,
+        # start_new_session, preexec_fn) -- none of which exist on Windows, where
+        # os.openpty() raises AttributeError. Skip it (callers fall back sensibly).
+        return MappingProxyType({})
     import subprocess
 
     cmdline = list(shell)
@@ -923,7 +1041,12 @@ def parse_uri_list(text: str) -> Generator[str, None, None]:
             yield line
             continue
         if purl.path:
-            yield unquote(purl.path)
+            path = unquote(purl.path)
+            # A Windows file URL is file:///C:/x, whose parsed path is /C:/x; drop
+            # the leading slash so it is a usable Windows path (C:/x).
+            if is_windows and len(path) > 2 and path[0] == '/' and path[2] == ':':
+                path = path[1:]
+            yield path
 
 
 def edit_config_file() -> None:
@@ -1289,6 +1412,76 @@ def sanitized_filename_from_url(url: str) -> str:
         return fname.replace(os.sep, '_')
     except Exception:
         return ''
+
+
+def windows_socket_tmp_dir() -> str:
+    """Where unix:/tmp/... lies on Windows, the user's own temp folder, which
+    kitten finds the same way. TMP and TEMP are not read, since an MSYS2 shell
+    points them at its own tmp folder, and kitty and kitten would disagree."""
+    if local := os.environ.get('LOCALAPPDATA'):
+        return os.path.join(local, 'Temp')
+    import tempfile
+
+    return tempfile.gettempdir()
+
+
+def windows_file_url(url: str, windows_path_of: Callable[[str], str] | None = None) -> str:
+    """The file URL for a file on this machine in the form Windows programs read,
+    file:///C:/path. MSYS2 and Cygwin shells name the C: drive /c and /cygdrive/c,
+    and WSL names it /mnt/c. windows_path_of turns any other path from an MSYS2
+    or Cygwin shell into its Windows path, or an empty string. Any other URL, a
+    file on another machine, and a WSL path outside /mnt come back as they were."""
+    import socket
+    from urllib.parse import quote, unquote, urlparse
+
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return url
+    if u.scheme.lower() != 'file' or u.netloc.lower() not in ('', 'localhost', socket.gethostname().lower()):
+        return url
+    path = unquote(u.path)
+    if m := re.match(r'/(?:cygdrive/|mnt/)?([a-zA-Z])(/.*)?$', path):
+        path = f'/{m.group(1).upper()}:{m.group(2) or "/"}'
+    elif windows_path_of and path.startswith('/') and not re.match(r'/[a-zA-Z]:(/|$)', path):
+        path = '/' + windows_path_of(path).replace('\\', '/')
+    if not re.match(r'/[a-zA-Z]:(/|$)', path):
+        return url
+    return 'file://' + quote(path, safe='/:')
+
+
+def posix_path_converter(exe: str) -> Callable[[str], str] | None:
+    """A function that turns a path an MSYS2 or Cygwin program prints into its
+    Windows path, through that runtime's own cygpath, since only it knows the
+    runtime's mounts, /tmp on the temp folder among them. None when exe does
+    not run on such a runtime."""
+    import subprocess
+
+    exe_dir = os.path.dirname(exe)
+    # The runtime sits beside the program, in usr\bin above it for Git Bash's
+    # bin\bash.exe, or below it for a shell started through msys2_shell.cmd in
+    # the MSYS2 folder or Cygwin.bat in the Cygwin one
+    for bin_dir in (exe_dir, os.path.join(os.path.dirname(exe_dir), 'usr', 'bin'), os.path.join(exe_dir, 'usr', 'bin'), os.path.join(exe_dir, 'bin')):
+        cygpath = os.path.join(bin_dir, 'cygpath.exe')
+        if os.path.exists(cygpath) and any(os.path.exists(os.path.join(bin_dir, dll)) for dll in ('msys-2.0.dll', 'cygwin1.dll')):
+            break
+    else:
+        return None
+
+    def windows_path_of(path: str) -> str:
+        try:
+            return subprocess.run(
+                [cygpath, '-w', path],
+                capture_output=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=5,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ''
+
+    return windows_path_of
 
 
 def as_file_url(wd: str, *components: str) -> str:

@@ -53,6 +53,9 @@ static void
 native_window_for_gpu(GLFWwindow *w, GPUNativeWindow *ans) {
 #ifdef __APPLE__
     *ans = (GPUNativeWindow){.platform = GPU_PLATFORM_COCOA, .handle = w ? glfwGetCocoaView(w) : NULL};
+#elif defined(_WIN32)
+    *ans =
+        (GPUNativeWindow){.platform = GPU_PLATFORM_WIN32, .handle = w ? glfwGetWin32Window(w) : NULL, .win32_presenter = w ? glfwGetWin32Presenter(w) : NULL};
 #else
     if (global_state.is_wayland) {
         *ans = (GPUNativeWindow){.platform = GPU_PLATFORM_WAYLAND, .display = glfwGetWaylandDisplay(), .handle = w ? glfwGetWaylandWindow(w) : NULL};
@@ -2076,7 +2079,15 @@ init_window_chrome_state(WindowChromeState *s, color_type active_window_bg, floa
     s->macos_colorspace = OPT(macos_colorspace);
     s->resizable = OPT(macos_window_resizable);
 #else
-    if (global_state.is_wayland) { SET_TCOL(OPT(wayland_titlebar_color)); }
+    if (global_state.is_wayland) {
+        SET_TCOL(OPT(wayland_titlebar_color));
+    }
+#ifdef _WIN32
+    else {
+        s->color = active_window_bg;
+        s->use_system_color = false;
+    }
+#endif
 #endif
     s->background_blur = should_blur ? OPT(background_blur) : 0;
     s->hide_window_decorations = OPT(hide_window_decorations);
@@ -2110,10 +2121,38 @@ apply_window_chrome_state(GLFWwindow *w, WindowChromeState new_state, int width,
         glfwSetWindowAttrib(w, GLFW_DECORATED, !hide_window_decorations);
         glfwSetWindowSize(w, width, height);
     }
+#ifdef _WIN32
+    // Publish the background colour so the win32 backend can match the
+    // caption to it. glfwSetWindowBlur re-reads this and restyles the caption.
+    {
+        char tb[16];
+        snprintf(tb, sizeof tb, "%06x", (unsigned)(new_state.color & 0xffffff));
+        setenv("KITTY_TITLEBAR_RGB", tb, 1);
+    }
+    // The acrylic material is tinted with these two, so it needs the window's
+    // own opacity, not the discounted one the renderer uses, see chrome_opacity.
+    {
+        char bo[16];
+        snprintf(bo, sizeof bo, "%.4f", (double)new_state.background_opacity);
+        setenv("KITTY_BACKGROUND_OPACITY", bo, 1);
+    }
+#endif
     glfwSetWindowBlur(w, new_state.background_blur);
     if (global_state.is_wayland) {
         if (glfwWaylandSetTitlebarColor) glfwWaylandSetTitlebarColor(w, new_state.color, new_state.use_system_color);
     }
+#endif
+}
+
+// The opacity the chrome state carries. On Windows the acrylic tint takes the
+// opacity asked for, and with blur on the discounted one is always 0, so only
+// the one asked for changes the state when set_background_opacity changes it.
+static float
+chrome_opacity(OSWindow *w) {
+#ifdef _WIN32
+    return effective_os_window_alpha(w) >= 1.f ? 1.f : w->background_opacity.requested;
+#else
+    return effective_os_window_alpha(w);
 #endif
 }
 
@@ -2133,7 +2172,7 @@ set_os_window_chrome(OSWindow *w) {
     }
 
     WindowChromeState new_state;
-    init_window_chrome_state(&new_state, bg, effective_os_window_alpha(w));
+    init_window_chrome_state(&new_state, bg, chrome_opacity(w));
     if (memcmp(&new_state, &w->last_window_chrome, sizeof(WindowChromeState)) != 0) {
         int width, height;
         glfwGetWindowSize(w->handle, &width, &height);
@@ -2744,7 +2783,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
             warned = true;
         }
     }
-    init_window_chrome_state(&w->last_window_chrome, OPT(background), effective_os_window_alpha(w));
+    init_window_chrome_state(&w->last_window_chrome, OPT(background), chrome_opacity(w));
     if (w->is_layer_shell) {
         if (global_state.is_apple) set_layer_shell_config_for(w, lsc);
     } else apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);
@@ -3005,6 +3044,8 @@ glfw_init(PyObject UNUSED *self, PyObject *args) {
         // module, which exports only the functions of its own platform.
 #ifdef __APPLE__
         const GPUNativeWindow display = {.platform = GPU_PLATFORM_COCOA};
+#elif defined(_WIN32)
+        const GPUNativeWindow display = {.platform = GPU_PLATFORM_WIN32};
 #else
         void *wl_display = glfwGetWaylandDisplay ? glfwGetWaylandDisplay() : NULL;
         // On X11, render frames need the Present extension, see glfwX11RequestFrameEvent()

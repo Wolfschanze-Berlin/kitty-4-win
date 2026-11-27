@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kovidgoyal/kitty"
@@ -26,8 +27,6 @@ import (
 	"github.com/kovidgoyal/kitty/tools/utils"
 	"github.com/kovidgoyal/kitty/tools/utils/humanize"
 	"github.com/kovidgoyal/kitty/tools/wcswidth"
-
-	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -62,7 +61,7 @@ type filesystem_file struct {
 // and that interrupted transfers do not leave truncated files behind.
 func new_filesystem_file(path string) (*filesystem_file, error) {
 	if s, err := os.Stat(path); err == nil && s.IsDir() {
-		return nil, &fs.PathError{Op: "open", Path: path, Err: unix.EISDIR}
+		return nil, &fs.PathError{Op: "open", Path: path, Err: syscall.EISDIR}
 	}
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".kitty-transfer-")
 	if err == nil {
@@ -71,11 +70,8 @@ func new_filesystem_file(path string) (*filesystem_file, error) {
 	if errors.Is(err, fs.ErrPermission) {
 		// The directory is not writable, fallback to writing in place, but
 		// only if that cannot affect any other file.
-		var st unix.Stat_t
-		if unix.Lstat(path, &st) == nil && st.Mode&unix.S_IFMT == unix.S_IFREG && st.Nlink == 1 {
-			if f, ferr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW, 0); ferr == nil {
-				return &filesystem_file{f: f}, nil
-			}
+		if f := open_for_writing_in_place(path); f != nil {
+			return &filesystem_file{f: f}, nil
 		}
 	}
 	return nil, err
@@ -308,34 +304,16 @@ func (self *remote_file) write_data(data []byte, is_last bool) (amt_written int6
 func syscall_mode(i os.FileMode) (o uint32) {
 	o |= uint32(i.Perm())
 	if i&os.ModeSetuid != 0 {
-		o |= unix.S_ISUID
+		o |= syscall.S_ISUID
 	}
 	if i&os.ModeSetgid != 0 {
-		o |= unix.S_ISGID
+		o |= syscall.S_ISGID
 	}
 	if i&os.ModeSticky != 0 {
-		o |= unix.S_ISVTX
+		o |= syscall.S_ISVTX
 	}
 	// No mapping for Go's ModeTemporary (plan9 only).
 	return
-}
-
-func (self *remote_file) apply_metadata() {
-	t := unix.NsecToTimespec(int64(self.mtime))
-	for {
-		if err := unix.UtimesNanoAt(unix.AT_FDCWD, self.expanded_local_path, []unix.Timespec{t, t}, unix.AT_SYMLINK_NOFOLLOW); err == nil || !(errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN)) {
-			break
-		}
-	}
-	if self.ftype == FileType_symlink {
-		for {
-			if err := unix.Fchmodat(unix.AT_FDCWD, self.expanded_local_path, syscall_mode(self.permissions), unix.AT_SYMLINK_NOFOLLOW); err == nil || !(errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN)) {
-				break
-			}
-		}
-	} else {
-		_ = os.Chmod(self.expanded_local_path, self.permissions)
-	}
 }
 
 func new_remote_file(opts *Options, ftc *FileTransmissionCommand, file_id uint64) (*remote_file, error) {

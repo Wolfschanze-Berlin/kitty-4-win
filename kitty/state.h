@@ -432,6 +432,15 @@ typedef struct Window {
         } *file_promises;
         size_t file_promises_count, file_promises_capacity;
     } drag_source;
+#ifdef _WIN32
+    // Where the cursor was last shown, and on which of the screen's buffers,
+    // so a brief hide keeps it on screen, see collect_cursor_info()
+    struct {
+        unsigned x, y;
+        const void *linebuf;
+        bool valid;
+    } shown_cursor;
+#endif
 } Window;
 
 typedef struct BorderRect {
@@ -477,8 +486,12 @@ typedef struct CursorTrail {
     float previous_corner_y[4]; // corner_y as of the previous frame
     float cursor_edge_x[2];
     float cursor_edge_y[2];
-    float prev_cursor_edge_x[2];                   // cursor_edge_x before the most recent cursor move
-    float prev_cursor_edge_y[2];                   // cursor_edge_y before the most recent cursor move
+    float prev_cursor_edge_x[2]; // cursor_edge_x before the most recent cursor move
+    float prev_cursor_edge_y[2]; // cursor_edge_y before the most recent cursor move
+#ifdef _WIN32
+    float edge_geometry[4]; // the window geometry, in NDC, that cursor_edge_* was last computed in
+    bool geometry_changed;  // set when the latest target was computed in a different geometry
+#endif
     CursorMove history[CURSOR_TRAIL_HISTORY_SIZE]; // recent cursor moves that started a trail, most recent first
 } CursorTrail;
 
@@ -663,6 +676,9 @@ typedef struct OSWindow {
     struct {
         float alpha;
         bool os_forces_opaque, supports_transparency;
+#ifdef _WIN32
+        float requested; // before platform_bg_alpha's discount, which the acrylic tint takes
+#endif
     } background_opacity;
     FONTS_DATA_HANDLE fonts_data;
     id_type temp_font_group_id;
@@ -938,6 +954,7 @@ void update_mouse_hover_for_os_window(OSWindow *os_window);
 // Ends the grab of the mouse by a window that was reported a press, reporting
 // the releases of the held buttons, for when their releases will not be delivered
 void cancel_mouse_grab(void);
+void apply_pending_mouse_pointer_shape(void);
 void update_pointer_shape_for_kitty_window(id_type kitty_window_id);
 bool update_link_hover_for_modifiers(int old_mods, int new_mods);
 void link_hover_cleared_by_output(Screen *screen);

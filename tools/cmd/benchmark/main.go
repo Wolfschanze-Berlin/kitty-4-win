@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kovidgoyal/kitty/tools/cli"
@@ -19,8 +20,6 @@ import (
 	"github.com/kovidgoyal/kitty/tools/tui/loop"
 	"github.com/kovidgoyal/kitty/tools/utils"
 	"github.com/kovidgoyal/kitty/tools/wcswidth"
-
-	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -122,7 +121,7 @@ func benchmark_data(description string, data string, settings run_settings) (dur
 	for !bytes.Contains(read_data, q) {
 		n, err := term.Read(buf)
 		if err != nil {
-			if (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR)) && n == 0 {
+			if (errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR)) && n == 0 {
 				continue
 			}
 			break

@@ -20,7 +20,6 @@ import (
 	"github.com/kovidgoyal/kitty/tools/utils"
 	"github.com/kovidgoyal/kitty/tools/utils/humanize"
 	"github.com/kovidgoyal/kitty/tools/utils/images"
-	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -188,7 +187,7 @@ func (s *calibre_server_process) close() {
 	s.stdin.Close()
 	s.stdout.Close()
 	// The request workers share the server's process group and can outlive it.
-	unix.Kill(-s.proc.Process.Pid, unix.SIGKILL)
+	kill_process_group(s.proc.Process)
 	<-s.reader_done
 	s.proc.Wait()
 }
@@ -205,7 +204,7 @@ var calibre_server = sync.OnceValues(func() (_ *calibre_server_process, err erro
 		stdout.Close()
 		return nil, err
 	}
-	cmd.SysProcAttr = &unix.SysProcAttr{Setsid: true}
+	set_process_session_leader(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("calibre-debug executable not found in PATH, you must install the calibre program to preview these file types: %w", err)
 	}

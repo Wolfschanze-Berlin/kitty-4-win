@@ -19,6 +19,8 @@ include = [
   "docs/conf.py",
   "gen"
 ]
+# Windows only stand ins for POSIX modules, see kitty/wincompat/pystubs
+exclude = ["kitty/wincompat/pystubs"]
 
 [tool.ruff]
 line-length = 160

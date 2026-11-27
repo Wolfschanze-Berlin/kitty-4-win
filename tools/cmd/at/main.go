@@ -16,8 +16,6 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/kovidgoyal/kitty"
 	"github.com/kovidgoyal/kitty/tools/cli"
 	"github.com/kovidgoyal/kitty/tools/crypto"
@@ -323,7 +321,7 @@ func get_password(password string, password_file string, password_env string, us
 				}
 				ttyf, err := os.Open(tty.Ctermid())
 				if err == nil {
-					err = unix.Dup2(int(ttyf.Fd()), int(os.Stdin.Fd())) //nolint ineffassign err is returned indicating duping failed
+					err = utils.Dup2(int(ttyf.Fd()), int(os.Stdin.Fd())) //nolint ineffassign err is returned indicating duping failed
 					ttyf.Close()
 				}
 			}
@@ -391,6 +389,9 @@ func setup_global_options(cmd *cli.Command) (err error) {
 		network, address, err := utils.ParseSocketAddress(rc_global_opts.To)
 		if err != nil {
 			return err
+		}
+		if network == "unix" {
+			address = utils.UnixSocketPath(address)
 		}
 		global_options.to_network = network
 		global_options.to_address = address

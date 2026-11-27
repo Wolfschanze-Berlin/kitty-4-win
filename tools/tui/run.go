@@ -4,7 +4,6 @@ package tui
 
 import (
 	"fmt"
-	"github.com/kovidgoyal/kitty"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,8 +12,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/kovidgoyal/kitty"
+
 	"github.com/shirou/gopsutil/v4/process"
-	"golang.org/x/sys/unix"
 
 	"github.com/kovidgoyal/kitty/tools/config"
 	"github.com/kovidgoyal/kitty/tools/tty"
@@ -65,12 +65,25 @@ var relevant_kitty_opts = sync.OnceValue(func() KittyOpts {
 	return read_relevant_kitty_opts()
 })
 
+// default_shell is the last-resort shell when nothing else resolves. /bin/sh does
+// not exist as a resolvable Windows path, so fall back to the Windows command
+// processor there (COMSPEC, i.e. cmd.exe) instead.
+func default_shell() string {
+	if runtime.GOOS == "windows" {
+		if c := os.Getenv("COMSPEC"); c != "" {
+			return c
+		}
+		return "cmd.exe"
+	}
+	return "/bin/sh"
+}
+
 func get_shell_from_kitty_conf() (shell string) {
 	shell = relevant_kitty_opts().Shell
 	if shell == "." {
 		s, e := utils.LoginShellForCurrentUser()
 		if e != nil {
-			shell = "/bin/sh"
+			shell = default_shell()
 		} else {
 			shell = s
 		}
@@ -92,7 +105,7 @@ func find_shell_parent_process() string {
 		}
 		if cmdline, err := p.CmdlineSlice(); err == nil && len(cmdline) > 0 {
 			exe := get_shell_name(filepath.Base(cmdline[0]))
-			if shell_integration.IsSupportedShell(exe) {
+			if is_parent_shell(exe) {
 				return exe
 			}
 		}
@@ -113,8 +126,8 @@ func ResolveShell(shell string) []string {
 		shell_cmd = []string{shell}
 	}
 	exe := utils.FindExe(shell_cmd[0])
-	if unix.Access(exe, unix.X_OK) != nil {
-		shell_cmd = []string{"/bin/sh"}
+	if utils.Access(exe, utils.AccessExec) != nil {
+		shell_cmd = []string{default_shell()}
 	}
 	return shell_cmd
 }
@@ -177,6 +190,8 @@ func RunShell(shell_cmd []string, shell_integration_env_var_val, cwd string) (er
 			shell_env = copy_os_env_as_dict()
 			shell_env["KITTY_SHELL_INTEGRATION"] = shell_integration_env_var_val
 		}
+	} else {
+		shell_cmd, shell_env = setup_native_shell_integration(shell_name, shell_integration_env_var_val, shell_cmd, shell_env)
 	}
 	exe := shell_cmd[0]
 	if runtime.GOOS == "darwin" && (os.Getenv("KITTY_RUNNING_SHELL_INTEGRATION_TEST") != "1" || os.Getenv("KITTY_RUNNING_BASH_INTEGRATION_TEST") != "") {
@@ -197,7 +212,7 @@ func RunShell(shell_cmd []string, shell_integration_env_var_val, cwd string) (er
 	if cwd != "" {
 		_ = os.Chdir(cwd)
 	}
-	return unix.Exec(utils.FindExe(exe), shell_cmd, env)
+	return utils.Exec(utils.FindExe(exe), shell_cmd, env)
 }
 
 var debugprintln = tty.DebugPrintln
@@ -211,8 +226,8 @@ func RunCommandRestoringTerminalToSaneStateAfter(cmd []string) {
 	c.Stderr = os.Stderr
 	term, err := tty.OpenControllingTerm()
 	if err == nil {
-		var state_before unix.Termios
-		if term.Tcgetattr(&state_before) == nil {
+		restore := save_term_state(term)
+		if restore != nil {
 			if _, err = term.WriteString(loop.SAVE_PRIVATE_MODE_VALUES); err != nil {
 				fmt.Fprintln(os.Stderr, "failed to write to controlling terminal with error:", err)
 				return
@@ -224,7 +239,7 @@ func RunCommandRestoringTerminalToSaneStateAfter(cmd []string) {
 					"\x1bP@kitty-restore-cursor-appearance|\a",
 					PROGRAM_STATUS_PROCESS_EXITED,
 				}, ""))
-				_ = term.Tcsetattr(tty.TCSANOW, &state_before)
+				restore()
 				term.Close()
 			}()
 		} else {

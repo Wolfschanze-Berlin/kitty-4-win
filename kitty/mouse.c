@@ -1076,7 +1076,15 @@ HANDLER(handle_move_event) {
             report_detailed_motion(w, all_modifiers);
         return;
     }
+    // The shape has to be recomputed on every move even without URL detection:
+    // it is what keeps a shape the application set with OSC 22 applied as the
+    // pointer moves within the region that asked for it. detect_url() does it
+    // itself, and once the application has grabbed the mouse it shows the link
+    // pointer only while the modifiers of a grabbed link mapping are held, so
+    // the pointer no longer flips between the link and grabbed shapes while an
+    // application such as the mouse-demo kitten repaints under it.
     if (OPT(detect_urls)) detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, modifiers);
+    else set_mouse_cursor_for_screen(screen);
     if (should_handle_in_kitty(w, screen, button)) {
         handle_mouse_movement_in_kitty(w, button, mouse_cell_changed | cell_half_changed);
     } else if (detailed_mouse_events(screen)) {
@@ -1543,6 +1551,34 @@ focus_in_event(void) {
     set_mouse_cursor(mouse_cursor_shape);
 }
 
+/* An application that repaints on mouse motion pops and pushes its pointer
+ * shape on every move: the mouse-demo kitten does exactly that, once per
+ * redraw. Applying each of those to the OS separately puts the fallback shape
+ * on screen in between, and whether that is visible depends on how the child's
+ * output happens to be split across reads. Under a Cygwin pty the pop and the
+ * push land in one batch and the fallback is overwritten before it is drawn,
+ * but conhost splits the stream on its own frame cadence, so on Windows it
+ * survives long enough to be seen as the pointer flashing back to the arrow.
+ *
+ * So record what the shape should be and apply it once per tick, after all
+ * input has been parsed. A pop followed by a push then costs one change rather
+ * than two, and the intermediate never reaches the screen. The OS window is
+ * remembered by id because callback_os_window is only set while a callback is
+ * running, and applying happens later. */
+static id_type pointer_shape_to_apply_for_os_window = 0;
+
+void
+apply_pending_mouse_pointer_shape(void) {
+    if (!pointer_shape_to_apply_for_os_window) return;
+    OSWindow *osw = os_window_for_id(pointer_shape_to_apply_for_os_window);
+    pointer_shape_to_apply_for_os_window = 0;
+    if (!osw) return;
+    OSWindow *orig = global_state.callback_os_window;
+    global_state.callback_os_window = osw;
+    set_mouse_cursor(mouse_cursor_shape);
+    global_state.callback_os_window = orig;
+}
+
 void
 update_mouse_pointer_shape(void) {
     mouse_cursor_shape = TEXT_POINTER;
@@ -1560,7 +1596,12 @@ update_mouse_pointer_shape(void) {
             if (r.window->render_data.screen->url_ranges.count && r.window->id == global_state.mouse_hover_in_window) mouse_cursor_shape = POINTER_POINTER;
         }
     }
-    set_mouse_cursor(mouse_cursor_shape);
+    // Deferred to apply_pending_mouse_pointer_shape, see above. Headless mock
+    // OS windows have no native cursor to apply it to, and no glfw to wake up.
+    if (global_state.callback_os_window && global_state.callback_os_window->handle) {
+        pointer_shape_to_apply_for_os_window = global_state.callback_os_window->id;
+        request_tick_callback();
+    } else pointer_shape_to_apply_for_os_window = 0;
 }
 
 void
@@ -1741,9 +1782,10 @@ update_link_hover_for_modifiers(int old_mods, int new_mods) {
 
 void
 enter_event(int modifiers, bool cursor_moved) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     // On cocoa there is no way to configure the window manager to
-    // focus windows on mouse enter, so we do it ourselves
+    // focus windows on mouse enter, so we do it ourselves. Windows does not
+    // do it by default either.
     if (OPT(focus_follows_mouse).on_cross && !global_state.callback_os_window->is_focused) {
         id_type wid = global_state.callback_os_window->id;
         focus_os_window(global_state.callback_os_window, false, NULL);

@@ -1,5 +1,9 @@
 // License: GPLv3 Copyright: 2025, Kovid Goyal, <kovid at kovidgoyal.net>
 
+// The dnd kitten refuses to start on Windows, where drag and drop is not built
+// and files cannot be identified by device and inode.
+//go:build !windows
+
 package dnd
 
 import (
@@ -1023,7 +1027,10 @@ func TestFindOverwrites_DirsNotReported(t *testing.T) {
 		t.Fatalf("find_overwrites: %v", err)
 	}
 	// Only the nested file should be reported, not "subdir".
-	if len(got) != 1 || got[0] != "subdir/file.txt" {
+	// ToSlash: find_overwrites builds paths with filepath.Join, so they carry
+	// the platform separator. The expectations are written POSIX style, and it
+	// is the set of reported paths that matters here, not the separator.
+	if len(got) != 1 || filepath.ToSlash(got[0]) != "subdir/file.txt" {
 		t.Errorf("expected [subdir/file.txt], got %v", got)
 	}
 }
@@ -1077,6 +1084,9 @@ func TestFindOverwrites_NestedTree(t *testing.T) {
 		t.Fatalf("find_overwrites: %v", err)
 	}
 	want := []string{"link", "sub/deep/file.txt", "sub/nested.txt", "top.txt"}
+	for i, g := range got {
+		got[i] = filepath.ToSlash(g)
+	}
 	if got2 := sortedStrings(got); !equalStringSlices(got2, want) {
 		t.Errorf("find_overwrites: got %v, want %v", got2, want)
 	}
@@ -1402,7 +1412,8 @@ func TestRenameContents_SymlinksInSubdirMovedAsIs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink dst/sub/abslink: %v", err)
 	}
-	if target != "/absolute/path" {
+	// Windows normalises separators when storing a reparse point.
+	if filepath.ToSlash(target) != "/absolute/path" {
 		t.Errorf("symlink target: got %q, want %q", target, "/absolute/path")
 	}
 }

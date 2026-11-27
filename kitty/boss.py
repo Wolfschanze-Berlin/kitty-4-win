@@ -53,7 +53,9 @@ from .constants import (
     handled_signals,
     is_macos,
     is_wayland,
+    is_windows,
     kitten_exe,
+    kitten_host_exe,
     kitty_exe,
     logo_png_file,
     supports_primary_selection,
@@ -176,8 +178,8 @@ from .utils import (
     get_new_os_window_size,
     is_ok_to_read_image_file,
     is_ok_to_read_image_path,
-    is_path_in_temp_dir,
     log_error,
+    may_delete_temp_graphics_file,
     open_url,
     parse_address_spec,
     parse_os_window_state,
@@ -232,18 +234,52 @@ class OSWindowDict(TypedDict):
 class Atexit:
     def __init__(self) -> None:
         self.worker: subprocess.Popen[bytes] | None = None
+        self.worker_unavailable = False
+        self.pending: list[str] = []
 
     def _write_line(self, line: str) -> None:
         if '\n' in line:
             raise ValueError('Newlines not allowed in atexit arguments: {path!r}')
+        if self.worker_unavailable:
+            self.pending.append(line)
+            return
         w = self.worker
         if w is None:
-            w = self.worker = subprocess.Popen([kitten_exe(), '__atexit__'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, close_fds=True)
+            try:
+                w = self.worker = subprocess.Popen(
+                    [kitten_exe(), '__atexit__'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    close_fds=True,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+            except OSError:
+                # The kitten worker is unavailable (e.g. not built on Windows).
+                # Clean these paths up in-process at exit instead.
+                import atexit
+
+                self.worker_unavailable = True
+                atexit.register(self._cleanup_pending)
+                self.pending.append(line)
+                return
             assert w.stdin is not None
             os.set_inheritable(w.stdin.fileno(), False)
         assert w.stdin is not None
         w.stdin.write((line + '\n').encode())
         w.stdin.flush()
+
+    def _cleanup_pending(self) -> None:
+        import shutil
+
+        for line in self.pending:
+            cmd, _, path = line.partition(' ')
+            try:
+                if cmd == 'unlink':
+                    os.unlink(path)
+                elif cmd == 'rmtree':
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
 
     def unlink(self, path: str) -> None:
         self._write_line(f'unlink {path}')
@@ -285,6 +321,20 @@ def remove_stale_unix_socket(socket_path: str) -> bool:
 def listen_on(spec: str, robust_atexit: Atexit) -> tuple[int, str]:
     import socket
 
+    if is_windows and spec.startswith('unix:'):
+        # CPython cannot make a Unix socket on Windows, which has them, so
+        # kitty's C code makes it, and kitten @ dials it as on Linux
+        from .fast_data_types import listen_on_unix_socket
+
+        path = spec[len('unix:') :]
+        if path.startswith('@'):
+            raise ValueError(f'Cannot listen on {spec}: abstract Unix sockets exist only on Linux. Use a path instead, such as unix:kitty.sock')
+        # Winsock reports a missing folder as a dead network
+        if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+            raise ValueError(f'Cannot listen on {spec}: the folder {os.path.dirname(os.path.abspath(path))} does not exist')
+        fd = listen_on_unix_socket(path)
+        robust_atexit.unlink(path)
+        return fd, spec
     family, address, socket_path = parse_address_spec(spec)
     s = socket.socket(family)
     try:
@@ -305,7 +355,11 @@ def listen_on(spec: str, robust_atexit: Atexit) -> tuple[int, str]:
                 raise OSError(err.errno, f'Another process is already listening on {socket_path}') from err
             raise OSError(err.errno, f'A file that is not a socket already exists at {socket_path}') from err
         s.bind(address)
-    if family == socket.AF_UNIX and socket_path:
+    # socket_path is set only for a non-abstract unix: address, so it already
+    # implies the family. Testing socket.AF_UNIX as well would be redundant, and
+    # it is an AttributeError on Windows, where CPython does not build it -- that
+    # was raising for tcp: addresses too, which need no AF_UNIX at all.
+    if socket_path:
         robust_atexit.unlink(socket_path)
     s.listen()
     if isinstance(address, tuple):  # tcp socket
@@ -1654,10 +1708,15 @@ class Boss:
             self.update_check_started = True
         self.monitor_desktop_session_if_needed()
         if opts.auto_reload_config >= 0 and not hasattr(self, 'config_reload_watcher_process') and opts.all_config_paths:
-            self.config_reload_watcher_process = subprocess.Popen(
-                [kitten_exe(), '__watch_conf__', str(os.getpid()), str(int(opts.auto_reload_config * 1000))] + list(opts.all_config_paths),
-                stdin=subprocess.PIPE,
-            )
+            try:
+                self.config_reload_watcher_process = subprocess.Popen(
+                    [kitten_exe(), '__watch_conf__', str(os.getpid()), str(int(opts.auto_reload_config * 1000))] + list(opts.all_config_paths),
+                    stdin=subprocess.PIPE,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+            except OSError:
+                # The kitten tool is unavailable (e.g. not built on Windows); skip config watching.
+                self.config_reload_watcher_process = None
 
     def handle_window_title_bar_mouse(self, os_window_id: int, window_id: int, x: float, y: float, button: int, modifiers: int, action: int) -> None:
         if tm := self.os_window_map.get(os_window_id):
@@ -2139,18 +2198,32 @@ class Boss:
                 return tab
         return None
 
+    def sync_tab_bar_and_chrome_bg(self, tm: 'TabManager') -> None:
+        # Keep the tab bar strip and the window chrome (titlebar + its buttons)
+        # tracking the active window's background when they follow the terminal
+        # background (tab_bar_background unset), so they update on tab switches, window
+        # focus changes and live theme previews, not only when a theme is applied.
+        aw = tm.active_window
+        if aw is not None and not get_options().tab_bar_background:
+            bg = aw.screen.color_profile.default_bg
+            if tm.tab_bar.draw_data.default_bg != bg:
+                tm.tab_bar.set_default_bg(bg)
+                tm.update_tab_bar_data()
+                tm.mark_tab_bar_dirty()
+        set_os_window_chrome(tm.os_window_id)
+
     def default_bg_changed_for(self, window_id: int, via_escape_code: bool = False) -> None:
         w = self.window_id_map.get(window_id)
         if w is not None:
             w.on_color_scheme_preference_change(via_escape_code=via_escape_code)
             tm = self.os_window_map.get(w.os_window_id)
             if tm is not None:
+                self.sync_tab_bar_and_chrome_bg(tm)
                 tm.update_tab_bar_data()
                 tm.mark_tab_bar_dirty()
                 t = tm.tab_for_id(w.tab_id)
                 if t is not None:
                     t.relayout_borders()
-                set_os_window_chrome(w.os_window_id)
 
     def dispatch_action(self, key_action: KeyAction, window_for_dispatch: Window | None = None, dispatch_type: str = 'KeyPress') -> bool:
 
@@ -2578,7 +2651,11 @@ class Boss:
             if opts.remember_window_position and not is_wayland() and not self.os_window_map:
                 self.cached_values['window-pos'] = x, y
                 self.cached_values['monitor-workarea'] = glfw_get_monitor_workarea()
-            self.cached_values['window-size'] = viewport_width, viewport_height
+            # Only record the size when NOT maximized, so it holds the real
+            # (restore) size. Otherwise a window closed while maximized would save
+            # the full-screen size, and unmaximizing it next launch would keep it.
+            if not was_maximized:
+                self.cached_values['window-size'] = viewport_width, viewport_height
             self.cached_values['window-state'] = 'maximized' if was_maximized else 'normal'
         if tm is not None:
             tm.destroy(self.quit_close_event() if self.is_quitting else None)
@@ -2707,6 +2784,10 @@ class Boss:
 
         if is_macos or not get_options().restore_session_after_logout or is_panel_kitten():
             return
+        if is_windows:
+            # The monitor is a D-Bus portal, and the win32 glfw has none
+            log_error('Restoring the session after logout: not supported on Windows yet')
+            return
         from .fast_data_types import dbus_monitor_session_state
 
         dbus_monitor_session_state(self.on_desktop_session_state_changed)
@@ -2794,6 +2875,11 @@ class Boss:
         from kittens.runner import CLIOnlyKitten, KittenMetadata, create_kitten_handler, resolved_kitten
 
         is_wrapped = kitten in wrapped_kitten_names()
+        if is_windows and is_wrapped and not os.access(kitten_exe(), os.X_OK):
+            # Fallback for a build without kitten.exe (it is built by default):
+            # the wrapped path cannot spawn without it, so run the kitten
+            # through the Python console launcher instead.
+            is_wrapped = False
         if window is None:
             w = self.active_window
             tab = self.active_tab
@@ -2858,6 +2944,23 @@ class Boss:
                 'OVERLAID_WINDOW_LINES': str(w.screen.lines),
                 'OVERLAID_WINDOW_COLS': str(w.screen.columns),
             }
+            if is_windows:
+                # Run kittens over plain pipes rather than a pseudoconsole (see
+                # child.c open_pty): their VT output reaches kitty untouched, so no
+                # flicker, and kitty gets EOF on exit so the overlay closes.
+                env['KITTY_KITTEN_NO_PTY'] = '1'
+                if data:
+                    # An overlay kitten's single stdin pipe carries keyboard input,
+                    # so _fork_windows cannot also feed it stdin data (a kitten like
+                    # hints would read its own keystrokes forever). Hand the data over
+                    # via a temp file the kitten reads and deletes, leaving the stdin
+                    # pipe free for keys.
+                    import tempfile
+
+                    dfd, dpath = tempfile.mkstemp(prefix='kitty-kitten-stdin-')
+                    with os.fdopen(dfd, 'wb') as df:
+                        df.write(data)
+                    env['KITTY_STDIN_DATA_FILE'] = dpath
             if is_wrapped:
                 cmd = [kitten_exe(), kitten]
                 env['KITTEN_RUNNING_AS_UI'] = '1'
@@ -2865,10 +2968,26 @@ class Boss:
                 if w is not None:
                     env['KITTY_BASIC_COLORS'] = json.dumps(w.screen.color_profile.basic_colors())
             else:
-                cmd = [kitty_exe(), '+runpy', 'from kittens.runner import main; main()']
+                cmd = [kitten_host_exe(), '+runpy', 'from kittens.runner import main; main()']
                 env['PYTHONWARNINGS'] = 'ignore'
             remote_control_fd = -1
-            if end_kitten.allow_remote_control:
+            if end_kitten.allow_remote_control and is_windows:
+                # Handing a kitten its own remote control socket needs three
+                # things that do not work here yet. A Windows socket is a kernel
+                # handle rather than a CRT descriptor, so os.dup and
+                # os.set_inheritable in add_fd_based_remote_control both fail on
+                # it with EBADF. The child's inherit list in child.c is exactly
+                # its two stdio pipes, so the socket would not reach it anyway.
+                # And the kitten would pick it up with socket.fromfd(...,
+                # AF_UNIX), which CPython does not build on Windows.
+                #
+                # The EBADF propagated out of here and stopped the kitten being
+                # created at all, which is why ctrl+shift+e and ctrl+shift+u
+                # opened nothing while kittens that ask for no remote control
+                # were fine. Run it without, which is what every other kitten
+                # here already does. See WINDOWS_TODO.
+                log_error(f'Running the {kitten} kitten without remote control: not supported on Windows yet')
+            elif end_kitten.allow_remote_control:
                 remote_control_passwords: dict[str, Sequence[str]] | None = None
                 initial_data = b''
                 if end_kitten.remote_control_password:
@@ -3016,10 +3135,23 @@ class Boss:
         env = {}
         env['KITTEN_RUNNING_AS_UI'] = '1'
         env['KITTY_CONFIG_DIRECTORY'] = config_dir
+        stdin = json.dumps({'msg': msg, 'tb': tb}).encode()
+        if is_windows:
+            # Like other overlay kittens, __show_error__ runs over plain pipes
+            # whose single stdin carries keyboard input, so it cannot also read the
+            # JSON payload from stdin. Hand it over via a temp file instead (see
+            # run_kitten_with_metadata and tui.ReadKittenInputData).
+            env['KITTY_KITTEN_NO_PTY'] = '1'
+            import tempfile
+
+            dfd, dpath = tempfile.mkstemp(prefix='kitty-kitten-stdin-')
+            with os.fdopen(dfd, 'wb') as df:
+                df.write(stdin)
+            env['KITTY_STDIN_DATA_FILE'] = dpath
         return SpecialWindow(
             cmd,
             override_title=title,
-            stdin=json.dumps({'msg': msg, 'tb': tb}).encode(),
+            stdin=stdin,
             env=env,
             overlay_for=overlay_for,
         )
@@ -3499,7 +3631,15 @@ class Boss:
         def doit(activation_token: str = '') -> None:
             nonlocal env
             pass_fds: list[int] = []
-            if allow_remote_control:
+            if allow_remote_control and is_windows:
+                # Same limitation as in run_kitten_with_metadata: a socket here is
+                # a kernel handle, not a CRT descriptor, so it cannot be dup'd or
+                # marked inheritable through the os module, and the child's
+                # inherit list would exclude it regardless. The EBADF stopped the
+                # process launching at all, which is what happened once the hints
+                # kitten had picked a URL and went to open it. See WINDOWS_TODO.
+                log_error('Launching a background process without remote control: not supported on Windows yet')
+            elif allow_remote_control:
                 remote = self.add_fd_based_remote_control(remote_control_passwords)
                 pass_fds.append(remote.fileno())
                 add_env('KITTY_LISTEN_ON', f'fd:{remote.fileno()}')
@@ -3514,10 +3654,30 @@ class Boss:
 
             def run(stdin: int | None, stdout: int | None, stderr: int | None) -> None:
                 try:
-                    p = subprocess.Popen(cmd, env=env, cwd=cwd, preexec_fn=clear_handled_signals, pass_fds=pass_fds, stdin=stdin, stdout=stdout, stderr=stderr)
+                    if is_windows:
+                        # preexec_fn and pass_fds both raise on Windows, and the
+                        # descriptors the child needs reach it as its standard handles
+                        p = subprocess.Popen(
+                            cmd, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                        )
+                    else:
+                        p = subprocess.Popen(
+                            cmd, env=env, cwd=cwd, preexec_fn=clear_handled_signals, pass_fds=pass_fds, stdin=stdin, stdout=stdout, stderr=stderr
+                        )
                     if notify_on_death:
                         self.background_process_death_notify_map[p.pid] = notify_on_death
                         monitor_pid(p.pid)
+                        if is_windows:
+                            # Nothing wakes the child monitor when a process that
+                            # is not a window's child exits, so a thread waits on
+                            # it and wakes the monitor, which then reaps it
+                            import threading
+
+                            def wake_when_done(proc: 'subprocess.Popen[bytes]' = p) -> None:
+                                proc.wait()
+                                self.child_monitor.wakeup()
+
+                            threading.Thread(target=wake_when_done, name='BackgroundProcessWaiter', daemon=True).start()
                 except Exception as err:
                     for fd in fds_to_close_on_launch_failure:
                         with suppress(OSError):
@@ -3543,7 +3703,8 @@ class Boss:
             finally:
                 if stdin:
                     os.close(r)
-                if allow_remote_control:
+                # On Windows no remote control socket was made, see above
+                if allow_remote_control and not is_windows:
                     remote.close()
 
         if is_wayland():
@@ -3854,7 +4015,7 @@ class Boss:
         clear_caches()
 
     def safe_delete_temp_file(self, path: str) -> None:
-        if is_path_in_temp_dir(path):
+        if may_delete_temp_graphics_file(path):
             with suppress(FileNotFoundError):
                 os.remove(path)
 

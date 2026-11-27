@@ -7,7 +7,7 @@
 
 // The interface between the OpenGL driver and the code that creates OpenGL
 // contexts for native windows using a platform specific API: GLX on X11, EGL
-// on Wayland and NSGL on macOS.
+// on Wayland, NSGL on macOS and WGL on Windows.
 
 #pragma once
 
@@ -54,6 +54,8 @@ typedef struct GLPlatform {
 
 #ifdef __APPLE__
 const GLPlatform *nsgl_platform(const GLPlatformHost *host);
+#elif defined(_WIN32)
+const GLPlatform *wgl_platform(const GLPlatformHost *host);
 #else
 const GLPlatform *glx_platform(const GLPlatformHost *host);
 const GLPlatform *egl_platform(const GLPlatformHost *host);

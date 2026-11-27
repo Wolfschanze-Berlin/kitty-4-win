@@ -99,6 +99,22 @@
     1,
     17
   ],
+  "win32": {
+    "headers": [
+      "win32_platform.h",
+      "win32_acrylic.h",
+      "win32_acrylic_noise.h",
+      "win32_joystick.h"
+    ],
+    "sources": [
+      "win32_init.c",
+      "win32_joystick.c",
+      "win32_monitor.c",
+      "win32_window.c",
+      "win32_acrylic.c",
+      "momentum-scroll.c"
+    ]
+  },
   "x11": {
     "headers": [
       "x11_platform.h",

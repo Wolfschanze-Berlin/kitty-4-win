@@ -94,6 +94,8 @@ def generate_wrappers(glfw_header: str) -> None:
     int glfwX11PopErrorTrap(void)
     void* glfwGetWaylandDisplay(void)
     void* glfwGetWaylandWindow(GLFWwindow* window)
+    void* glfwGetWin32Window(GLFWwindow* window)
+    void* glfwGetWin32Presenter(GLFWwindow* window)
     void glfwSetPrimarySelectionString(GLFWwindow* window, const char* string)
     void glfwCocoaCycleThroughOSWindows(bool backwards)
     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\

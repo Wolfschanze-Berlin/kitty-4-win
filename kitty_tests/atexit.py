@@ -12,9 +12,10 @@ import tempfile
 from kitty.constants import kitten_exe, kitty_exe
 from kitty.shm import SharedMemory
 
-from .base import BaseTest
+from .base import BaseTest, skip_on_windows
 
 
+@skip_on_windows('asserts a child ignores SIGINT/SIGTERM, waitpid on a grandchild, POSIX shm and select on a pipe')
 class Atexit(BaseTest):
     def setUp(self):
         self.tdir = tempfile.mkdtemp()
@@ -34,9 +35,12 @@ class Atexit(BaseTest):
                 [
                     kitty_exe(),
                     '+runpy',
+                    # repr() the path rather than interpolating it bare: this source is
+                    # exec'd, and a Windows path puts backslashes in a string literal,
+                    # where C:\\Users\\... reads as the escape \\U and is a SyntaxError.
                     f"""\
 import subprocess
-p = subprocess.Popen(['{kitten_exe()}', '__atexit__'])
+p = subprocess.Popen([{kitten_exe()!r}, '__atexit__'])
 print(p.pid, flush=True)
 raise SystemExit(p.wait())
 """,

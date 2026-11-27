@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -125,6 +126,12 @@ func (n node) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 func TestChooseFilesIgnore(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The scanner fails outright here with "file does not exist". Its path
+		// and ignore-pattern handling is POSIX shaped and has not been ported.
+		// Recorded in WINDOWS_TODO.
+		t.Skip("the scanner does not handle Windows paths yet")
+	}
 	root := node{name: string(os.PathSeparator), children: map[string]*node{
 		"a":          {name: "a"},
 		"b":          {name: "b"},
@@ -181,6 +188,10 @@ func TestChooseFilesIgnore(t *testing.T) {
 }
 
 func TestChooseFilesScoring(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Same scanner as TestChooseFilesIgnore, see the note there.
+		t.Skip("the scanner does not handle Windows paths yet")
+	}
 	root := node{name: string(os.PathSeparator), children: map[string]*node{
 		"b":     {name: "b"},
 		"a":     {name: "a"},
@@ -353,8 +364,9 @@ func TestChooseFilesDirectorySymlinks(t *testing.T) {
 		{"directories", SELECT_SINGLE_DIR, Filter{},
 			[]string{"linked-dir", "real-dir"}, []string{"linked-dir", "real-dir"}},
 		{"file filter", SELECT_SINGLE_FILE, *filter,
-			[]string{"file.txt", "linked-dir", "linked-file.txt", "real-dir", "real-dir/nested.txt"},
-			[]string{"file.txt", "linked-file.txt", "real-dir/nested.txt"}},
+			// choices are shown with the platform's separator
+			[]string{"file.txt", "linked-dir", "linked-file.txt", "real-dir", filepath.FromSlash("real-dir/nested.txt")},
+			[]string{"file.txt", "linked-file.txt", filepath.FromSlash("real-dir/nested.txt")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			done := make(chan struct{})

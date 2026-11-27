@@ -12,3 +12,5 @@ kitty/parse-graphics-command.h
 kitty/parse-multicell-command.h
 kittens/unicode_input/names.h
 3rdparty/**
+glfw/caption_icons.h
+glfw/win32_acrylic_noise.h

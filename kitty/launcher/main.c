@@ -290,6 +290,23 @@ read_exe_path(char *exe, size_t buf_sz) {
     return false;
 }
 
+#elif defined(_WIN32)
+
+static bool
+read_exe_path(char *exe, size_t buf_sz) {
+    wchar_t wpath[4096];
+    DWORD n = GetModuleFileNameW(NULL, wpath, 4096);
+    if (n == 0 || n >= 4096) {
+        fprintf(stderr, "GetModuleFileName failed\n");
+        return false;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, wpath, -1, exe, (int)buf_sz, NULL, NULL) == 0) {
+        fprintf(stderr, "Failed to convert exe path to UTF-8\n");
+        return false;
+    }
+    return true;
+}
+
 #else
 
 static bool
@@ -331,6 +348,30 @@ reopen_to_null(const char *mode, FILE *stream) {
 
 static bool
 ensure_working_stdio(void) {
+#ifdef _WIN32
+    // kitty.exe is a GUI-subsystem binary, so when run from a terminal it gets
+    // no console and anything it prints (kitty --version, kitty +list-fonts,
+    // startup errors) silently vanishes. Attach to the parent's console when
+    // there is one, wiring up only the std streams that were not already
+    // redirected somewhere real by the caller. The usability checks must
+    // happen BEFORE AttachConsole: attaching fills in the std handles, but the
+    // CRT's FILE streams stay bound to the old descriptors until freopen. A
+    // handle can also be inherited yet unusable (a GUI parent like the PATH
+    // shim passes stale values), so validate with GetFileType rather than
+    // testing for NULL alone.
+#define usable(which) (GetStdHandle(which) != NULL && GetStdHandle(which) != INVALID_HANDLE_VALUE && GetFileType(GetStdHandle(which)) != FILE_TYPE_UNKNOWN)
+    bool no_in = !usable(STD_INPUT_HANDLE);
+    bool no_out = !usable(STD_OUTPUT_HANDLE);
+    bool no_err = !usable(STD_ERROR_HANDLE);
+#undef usable
+    if (GetConsoleWindow() == NULL) AttachConsole(ATTACH_PARENT_PROCESS);
+    if (GetConsoleWindow() != NULL) { // attached now, or inherited from the parent
+        if (no_in) freopen("CONIN$", "r", stdin);
+        if (no_out) freopen("CONOUT$", "w", stdout);
+        if (no_err) freopen("CONOUT$", "w", stderr);
+    }
+    return true;
+#endif
 #define C(which, mode)                                      \
     {                                                       \
         int fd = fileno(which);                             \
@@ -352,16 +393,104 @@ is_wrapped_kitten(const char *arg) {
     return strstr(" " WRAPPED_KITTENS " ", buf);
 }
 
+#ifdef _WIN32
+// The UTF-16 of a string in the given code page, which the caller frees
+static wchar_t *
+wide_from(UINT code_page, const char *s) {
+    const int n = MultiByteToWideChar(code_page, 0, s, -1, NULL, 0);
+    wchar_t *ans = n > 0 ? calloc(n, sizeof(wchar_t)) : NULL;
+    if (ans) MultiByteToWideChar(code_page, 0, s, -1, ans, n);
+    return ans;
+}
+
+// argv as one command line, each argument quoted the way CommandLineToArgvW
+// reads it back, or NULL. The CRT hands main its arguments in the ANSI code
+// page, as execv passed them on before.
+static wchar_t *
+quoted_command_line(int argc, char *argv[]) {
+    size_t cap = 1;
+    for (int i = 0; i < argc; i++) cap += 2 * strlen(argv[i]) + 3; // a byte is at most one UTF-16 unit
+    wchar_t *ans = calloc(cap, sizeof(wchar_t)), *p = ans;
+    if (!ans) return NULL;
+    for (int i = 0; i < argc; i++) {
+        wchar_t *arg = wide_from(CP_ACP, argv[i]);
+        if (!arg) {
+            free(ans);
+            return NULL;
+        }
+        if (i) *p++ = L' ';
+        if (arg[0] && !wcspbrk(arg, L" \t\n\v\"")) {
+            wcscpy(p, arg);
+            p += wcslen(arg);
+        } else {
+            *p++ = L'"';
+            for (const wchar_t *c = arg;; c++) {
+                size_t backslashes = 0;
+                while (*c == L'\\') {
+                    backslashes++;
+                    c++;
+                }
+                if (!*c) {
+                    while (backslashes--) {
+                        *p++ = L'\\';
+                        *p++ = L'\\';
+                    }
+                    break;
+                }
+                if (*c == L'"') {
+                    for (size_t k = 0; k < 2 * backslashes + 1; k++) *p++ = L'\\';
+                } else {
+                    while (backslashes--) *p++ = L'\\';
+                }
+                *p++ = *c;
+            }
+            *p++ = L'"';
+        }
+        free(arg);
+    }
+    *p = 0;
+    return ans;
+}
+
+// The CRT's execv passes its arguments unquoted, so one with a space reached
+// kitten split in two, and ends this process at once, so a shell waiting on
+// kitty got its prompt back before kitten printed and lost its exit code.
+// kitten runs as a child instead, its exit code becoming kitty's.
+static void
+run_kitten_and_exit(const char *exe, int argc, char *argv[]) {
+    wchar_t *wexe = wide_from(CP_UTF8, exe), *cmdline = quoted_command_line(argc, argv); // read_exe_path writes UTF-8
+    STARTUPINFOW si = {.cb = sizeof(si)};
+    PROCESS_INFORMATION pi;
+    if (!wexe || !cmdline || !CreateProcessW(wexe, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "Failed to execute kitten (%s) with Windows error: %lu\n", exe, GetLastError());
+        exit(1);
+    }
+    // Ctrl+C reaches kitten too, which decides when it ends
+    SetConsoleCtrlHandler(NULL, TRUE);
+    DWORD code = 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &code);
+    exit((int)code);
+}
+#endif
+
 static void
 exec_kitten(int argc, char *argv[], char *exe_dir) {
     char exe[PATH_MAX + 1] = {0};
+#ifdef _WIN32
+    safe_snprintf(exe, PATH_MAX, "%s\\kitten.exe", exe_dir);
+#else
     safe_snprintf(exe, PATH_MAX, "%s/kitten", exe_dir);
+#endif
     argv[0] = "kitten";
     if (being_tested) {
         printf("kitten_exe: %s\n", exe);
         output_argv("argv", argc, argv);
         exit(0);
     }
+#ifdef _WIN32
+    run_kitten_and_exit(exe, argc, argv);
+#endif
     errno = 0;
     execv(exe, argv);
     fprintf(stderr, "Failed to execute kitten (%s) with error: %s\n", exe, strerror(errno));
@@ -438,6 +567,20 @@ handle_fast_commandline(CLISpec *cli_spec, const char *instance_group_prefix, in
         } else {
             printf("kitty %s created by Kovid Goyal\n", KITTY_VERSION);
         }
+#ifdef _WIN32
+        // The same credit line version() in kitty/cli.py prints, repeated here
+        // because this path never reaches Python: the launcher answers
+        // --version itself and exits. Truecolor is emitted in the semicolon
+        // form because conhost mangles the colon form and drops the colour.
+        if (isatty(STDOUT_FILENO)) {
+            printf(
+                "\x1b[3mWindows native port by \x1b[23m"
+                "\x1b[38;2;253;151;31mecstra\x1b[39m "
+                "\x1b[2m<\x1b[22m\x1b[96mgotham47g@gmail.com\x1b[39m\x1b[2m>\x1b[22m\n");
+        } else {
+            printf("Windows native port by ecstra <gotham47g@gmail.com>\n");
+        }
+#endif
         exit(0);
     }
     opts.session = get_string_cli_val(cli_spec, "session");

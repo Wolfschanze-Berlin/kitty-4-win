@@ -16,7 +16,7 @@ from kitty.constants import kitten_exe
 from kitty.file_transmission import Action, Compression, FileTransmissionCommand, FileType, TransmissionType, ZlibDecompressor
 from kitty.file_transmission import TestFileTransmission as FileTransmission
 
-from .base import PTY, BaseTest
+from .base import PTY, BaseTest, skip_on_windows
 
 
 def response(id='test', msg='', file_id='', name='', action='status', status='', size=-1):
@@ -178,6 +178,7 @@ class TransferPTY(PTY):
         self.fc = PtyFileTransmission(self, allow=allow)
 
 
+@skip_on_windows('drives a pty and uses mkfifo, neither of which exists here')
 class TestFileTransmission(BaseTest):
     def setUp(self):
         self.direction_receive = False

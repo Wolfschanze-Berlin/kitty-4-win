@@ -81,6 +81,16 @@ typedef struct {
     unsigned long id;
     pid_t pid;
     int exit_status;
+#ifdef _WIN32
+    // Kitten side channel streams open to this window, and the console resize
+    // held back while a kitten drawing over one owns the screen, see
+    // resize_pty().
+    unsigned side_channel_streams;
+    struct {
+        bool pending;
+        unsigned short cols, rows;
+    } held_resize;
+#endif
 } Child;
 
 static const Child EMPTY_CHILD = {0};
@@ -104,7 +114,11 @@ static ChildMonitor *the_monitor = NULL;
 
 typedef struct {
     pid_t pid;
+#ifdef _WIN32
+    long long status; // a Windows exit code uses all 32 bits, and is shifted by 8 as waitpid's
+#else
     int status;
+#endif
 } ReapedPID;
 
 static pid_t monitored_pids[256] = {0};
@@ -437,6 +451,247 @@ wakeup_io_loop(ChildMonitor *self, bool in_signal_handler) {
     wakeup_loop(&self->io_loop_data, in_signal_handler, "io_loop");
 }
 
+#ifdef _WIN32
+#include <sddl.h>   // the graphics pipe's permissions
+#include <aclapi.h> // and their check
+/* Called from child.c's process-exit thread-pool callback (the Windows stand-in
+ * for SIGCHLD). Wake the io_loop so it reaps exited children. */
+void
+windows_wakeup_child_monitor(void) {
+    if (the_monitor) wakeup_io_loop(the_monitor, false);
+}
+
+/* Windows has no SIGUSR1, so a config-reload request (e.g. from the themes
+ * kitten after it writes the chosen theme) is delivered via a per-process named
+ * event. A dedicated thread waits on it and sets the same flag the SIGUSR1
+ * handler would on POSIX, then wakes the io_loop. The event name embeds kitty's
+ * pid so the kitten, which knows it via KITTY_PID, can open and signal it. */
+static HANDLE reload_event = NULL;
+
+static DWORD WINAPI
+reload_event_waiter(LPVOID param) {
+    HANDLE ev = (HANDLE)param;
+    while (WaitForSingleObject(ev, INFINITE) == WAIT_OBJECT_0) {
+        reload_config_signal_received = true;
+        windows_wakeup_child_monitor();
+    }
+    return 0;
+}
+
+static void
+start_windows_reload_listener(void) {
+    if (reload_event) return;
+    wchar_t name[64];
+    _snwprintf(name, sizeof(name) / sizeof(name[0]), L"Local\\kitty-reload-%lu", (unsigned long)GetCurrentProcessId());
+    reload_event = CreateEventW(NULL, FALSE, FALSE, name); /* auto-reset, initially non-signaled */
+    if (reload_event) {
+        HANDLE t = CreateThread(NULL, 0, reload_event_waiter, reload_event, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+}
+
+/* Graphics-protocol side channel. Windows ConPTY (conhost) re-renders the child's
+ * output into a text grid and drops escape sequences it does not understand, so
+ * the kitty graphics protocol APC (\x1b_G...) written by a kitten never survives
+ * the trip to kitty. Instead a kitten sends the transmit command straight to kitty
+ * over this named pipe; we inject it into the target window's parser below, on the
+ * io_loop thread, exactly like bytes read from a child. The image is then placed
+ * with unicode placeholders, which are plain text and pass through conhost intact.
+ * The pipe name embeds kitty's pid (the kitten knows it via KITTY_PID); the first
+ * 8 bytes of each message are the target window id (little-endian), the rest is the
+ * raw graphics command. */
+#define GFX_QUEUE_SZ 64
+typedef struct {
+    id_type window_id;
+    uint8_t *data;
+    size_t sz;
+    int stream_delta; // +1 or -1 as a stream opens or closes, with no data
+} GfxInjection;
+static GfxInjection gfx_queue[GFX_QUEUE_SZ];
+static unsigned gfx_queue_count = 0;
+static pthread_mutex_t gfx_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool gfx_listener_started = false;
+
+/* Enqueue one chunk for injection, blocking (with backpressure on the pipe
+ * connection) while the queue is full. Dropping is not an option: the payload
+ * is a VT byte stream and a lost chunk would corrupt the window's parser state. */
+static void
+gfx_enqueue_chunk(id_type window_id, uint8_t *payload, size_t sz, int stream_delta) {
+    for (;;) {
+        pthread_mutex_lock(&gfx_queue_lock);
+        if (gfx_queue_count < GFX_QUEUE_SZ) {
+            gfx_queue[gfx_queue_count++] = (GfxInjection){.window_id = window_id, .data = payload, .sz = sz, .stream_delta = stream_delta};
+            pthread_mutex_unlock(&gfx_queue_lock);
+            windows_wakeup_child_monitor();
+            return;
+        }
+        pthread_mutex_unlock(&gfx_queue_lock);
+        windows_wakeup_child_monitor();
+        Sleep(1);
+    }
+}
+
+/* One thread per client connection, so a long-lived streaming client (a kitten
+ * TUI routing its output around conhost) does not block one-shot clients (icat
+ * image transmits, edit-in-kitty DCS). The first 8 bytes are the target window
+ * id; every subsequent chunk is injected into that window's parser as it
+ * arrives, so both one-shot messages and continuous streams work: the parser
+ * is incremental and does not care how the bytes are split. */
+static DWORD WINAPI
+gfx_connection_handler(LPVOID param) {
+    HANDLE pipe = (HANDLE)param;
+    uint8_t hdr[8];
+    size_t hread = 0;
+    DWORD got = 0;
+    while (hread < 8) {
+        if (!ReadFile(pipe, hdr + hread, (DWORD)(8 - hread), &got, NULL) || got == 0) goto done;
+        hread += got;
+    }
+    id_type window_id = 0;
+    for (unsigned i = 0; i < 8; i++) window_id |= ((id_type)hdr[i]) << (8u * i);
+    // The open and close marks travel through the same queue as the data, so
+    // the io loop sees them in order with what the stream drew.
+    gfx_enqueue_chunk(window_id, NULL, 0, 1);
+    for (;;) {
+        uint8_t *buf = malloc(1u << 16);
+        if (!buf) break;
+        if (!ReadFile(pipe, buf, 1u << 16, &got, NULL) || got == 0) {
+            free(buf);
+            break;
+        }
+        gfx_enqueue_chunk(window_id, buf, got, 0);
+    }
+    gfx_enqueue_chunk(window_id, NULL, 0, -1);
+done:
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+    return 0;
+}
+
+// Token information of one class, which the caller frees
+static void *
+own_token_info(TOKEN_INFORMATION_CLASS which) {
+    HANDLE token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return NULL;
+    DWORD sz = 0;
+    GetTokenInformation(token, which, NULL, 0, &sz);
+    void *ans = sz ? malloc(sz) : NULL;
+    if (ans && !GetTokenInformation(token, which, ans, sz, &sz)) {
+        free(ans);
+        ans = NULL;
+    }
+    CloseHandle(token);
+    return ans;
+}
+
+// Whether the pipe a new instance joined is kitty's own, its owner being the
+// one kitty's own objects get
+static bool
+pipe_is_ours(HANDLE pipe, PSID owner_of_ours) {
+    PSID owner = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    const bool ans = GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &sd) == ERROR_SUCCESS && owner &&
+                     EqualSid(owner, owner_of_ours);
+    if (sd) LocalFree(sd);
+    return ans;
+}
+
+// One instance of the graphics pipe, or NULL once it cannot be kitty's own
+static HANDLE
+new_gfx_pipe_instance(const char *name, SECURITY_ATTRIBUTES *sa, PSID owner, bool first) {
+    // Named pipes take clients over SMB too, so another machine signed in as
+    // the user or an administrator could write into any kitty window. The
+    // pipe is for programs on this machine only.
+    HANDLE pipe = CreateNamedPipeA(
+        name,
+        PIPE_ACCESS_INBOUND | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_UNLIMITED_INSTANCES,
+        0,
+        1u << 16,
+        0,
+        sa);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        if (first) log_error("Not starting the graphics pipe, as %s already exists, made by another program", name);
+        else log_error("Stopping the graphics pipe, as another instance of %s could not be made, Windows error %lu", name, GetLastError());
+        return NULL;
+    }
+    if (!pipe_is_ours(pipe, owner)) {
+        log_error("Stopping the graphics pipe, as %s now belongs to another program", name);
+        CloseHandle(pipe);
+        return NULL;
+    }
+    return pipe;
+}
+
+static DWORD WINAPI
+graphics_pipe_waiter(LPVOID param) {
+    (void)param;
+    char name[64];
+    snprintf(name, sizeof(name), "\\\\.\\pipe\\kitty-gfx-%lu", (unsigned long)GetCurrentProcessId());
+    // The name can be predicted from kitty's pid, so another user on the
+    // machine could create the pipe first and have kitty's instances join it,
+    // under that user's permissions, then write into kitty's windows. So the
+    // first instance must be the first of its name, every instance must be on
+    // kitty's own pipe, and only kitty's own kind of process may use it. That
+    // is the owner kitty's objects get, the user for an ordinary kitty and
+    // Administrators for an elevated one, as Windows' own default grants, and
+    // SYSTEM, behind a no write up label at kitty's integrity level, so an
+    // elevated kitty takes no writes from the user's unelevated programs.
+    TOKEN_OWNER *owner = own_token_info(TokenOwner);
+    TOKEN_MANDATORY_LABEL *level = own_token_info(TokenIntegrityLevel);
+    char *owner_sid = NULL, *level_sid = NULL, sddl[384];
+    SECURITY_ATTRIBUTES sa = {.nLength = sizeof(sa)};
+    if (!owner || !level || !ConvertSidToStringSidA(owner->Owner, &owner_sid) || !ConvertSidToStringSidA(level->Label.Sid, &level_sid) ||
+        snprintf(sddl, sizeof(sddl), "D:P(A;;GA;;;%s)(A;;GA;;;SY)S:(ML;;NW;;;%s)", owner_sid, level_sid) >= (int)sizeof(sddl) ||
+        !ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
+        log_error("Not starting the graphics pipe, as its permissions could not be set up");
+        goto end;
+    }
+    HANDLE pipe = new_gfx_pipe_instance(name, &sa, owner->Owner, true);
+    while (pipe) {
+        if (!ConnectNamedPipe(pipe, NULL)) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_NO_DATA) {
+                // The client left before it was taken, so this instance waits for the next one
+                DisconnectNamedPipe(pipe);
+                continue;
+            }
+            if (err != ERROR_PIPE_CONNECTED) {
+                log_error("Stopping the graphics pipe, as waiting for a client failed with Windows error %lu", err);
+                CloseHandle(pipe);
+                break;
+            }
+        }
+        // The next instance exists before this one can close, so the pipe's
+        // name is never free for another program to take while kitty runs
+        HANDLE next = new_gfx_pipe_instance(name, &sa, owner->Owner, false);
+        HANDLE t = CreateThread(NULL, 0, gfx_connection_handler, pipe, 0, NULL);
+        if (t) CloseHandle(t);
+        else {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+        pipe = next;
+    }
+end:
+    if (sa.lpSecurityDescriptor) LocalFree(sa.lpSecurityDescriptor);
+    if (owner_sid) LocalFree(owner_sid);
+    if (level_sid) LocalFree(level_sid);
+    free(owner);
+    free(level);
+    return 0;
+}
+
+static void
+start_windows_graphics_listener(void) {
+    if (gfx_listener_started) return;
+    gfx_listener_started = true;
+    HANDLE t = CreateThread(NULL, 0, graphics_pipe_waiter, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+#endif
+
 static void *io_loop(void *data);
 static void *talk_loop(void *data);
 static void send_response_to_peer(id_type peer_id, const char *msg, size_t msg_sz, bool is_async_response);
@@ -503,6 +758,10 @@ start(PyObject *s, PyObject *a UNUSED) {
     }
     ret = pthread_create(&self->io_thread, NULL, io_loop, self);
     if (ret != 0) return PyErr_Format(PyExc_OSError, "Failed to start I/O thread with error: %s", strerror(ret));
+#ifdef _WIN32
+    start_windows_reload_listener();
+    start_windows_graphics_listener();
+#endif
 
     Py_RETURN_NONE;
 }
@@ -811,12 +1070,20 @@ parse_input(ChildMonitor *self) {
             Message *msg = msgs + i;
             PyObject *resp = NULL;
             if (msg->data) {
+                // The length must be passed as Py_ssize_t: PY_SSIZE_T_CLEAN is
+                // set, so y# reads eight bytes here. Passing an int is harmless
+                // on the SysV ABI, where this argument still lands in a register
+                // and the write to its low half zeroes the top. Win64 passes only
+                // four arguments in registers, so this one is the first on the
+                // stack, and four bytes of stale stack were being read as the top
+                // half of the length. The result was a nonsense size and a
+                // MemoryError instead of a remote control command.
                 resp = PyObject_CallMethod(
                     global_state.boss,
                     "peer_message_received",
                     "y#KO",
                     msg->data,
-                    (int)msg->sz,
+                    (Py_ssize_t)msg->sz,
                     msg->peer_id,
                     msg->is_remote_control_peer ? Py_True : Py_False);
                 free(msg->data);
@@ -897,6 +1164,12 @@ mark_for_close(ChildMonitor *self, PyObject *args) {
 
 static bool
 pty_resize(int fd, struct winsize *dim) {
+#ifdef _WIN32
+    // No ioctl on Windows: resize the pseudoconsole directly.
+    extern int windows_pty_resize_for(int read_fd, int cols, int rows);
+    windows_pty_resize_for(fd, dim->ws_col, dim->ws_row);
+    return true;
+#else
     while (true) {
         if (ioctl(fd, TIOCSWINSZ, dim) == -1) {
             if (errno == EINTR) continue;
@@ -908,6 +1181,7 @@ pty_resize(int fd, struct winsize *dim) {
         break;
     }
     return true;
+#endif
 }
 
 static PyObject *
@@ -928,10 +1202,33 @@ resize_pty(ChildMonitor *self, PyObject *args) {
         }                                    \
     }
     FIND(children, self->count);
+#ifdef _WIN32
+    // A kitten drawing over the side channel owns the screen. Resizing the
+    // console now would have conhost repaint its own copy, which never held the
+    // kitten's UI, right over it. Such a kitten reads its size from the in-band
+    // notification, which it asked for, so hold the console back until its
+    // stream closes. A stream with no in-band notification, such as the ssh
+    // kitten's while ssh draws through the console, holds nothing back.
+    for (size_t i = 0; fd != -1 && i < self->count; i++) {
+        if (children[i].id != window_id) continue;
+        if (children[i].side_channel_streams && children[i].screen->modes.mINBAND_RESIZE_NOTIFICATION) {
+            children[i].held_resize.pending = true;
+            children[i].held_resize.cols = dim.ws_col;
+            children[i].held_resize.rows = dim.ws_row;
+            fd = -2;
+        } else {
+            // This size reaches the console now, so a size held back earlier,
+            // such as by a kitten that turned its notification off on exit just
+            // before its stream closed, must not be applied over it later.
+            children[i].held_resize.pending = false;
+        }
+    }
+#endif
     if (fd == -1) FIND(add_queue, add_queue_count);
-    if (fd != -1) {
+    if (fd >= 0) {
         if (!pty_resize(fd, &dim)) PyErr_SetFromErrno(PyExc_OSError);
-    } else log_error("Failed to send resize signal to child with id: %lu (children count: %u) (add queue: %zu)", window_id, self->count, add_queue_count);
+    } else if (fd == -1)
+        log_error("Failed to send resize signal to child with id: %lu (children count: %u) (add queue: %zu)", window_id, self->count, add_queue_count);
     children_mutex(unlock);
     if (PyErr_Occurred()) return NULL;
     Py_RETURN_NONE;
@@ -1000,6 +1297,31 @@ collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow 
     if (!rendered_scrolled_by(rd->screen)) {
         ans->multicursor_count = screen_multi_cursor_count(rd->screen);
         ans->is_visible = screen_is_cursor_visible(rd->screen);
+#ifdef _WIN32
+        // conhost hands kitty a PSReadLine repaint in two pieces about 10 ms
+        // apart, the cursor hide alone, then the text and the cursor show. A
+        // frame drawn between them had no cursor, so it flashed on every key.
+        // A hide shorter than this keeps the cursor where it was last shown,
+        // and a real hide takes effect once it has lasted this long. It counts
+        // from the hide itself, so one made while the window was not drawn
+        // never shows, and a switch to the other buffer, as a program entering
+        // the alternate screen makes, never carries the cursor across.
+        const monotonic_t brief_hide = ms_to_monotonic_t(50ll);
+        if (ans->is_visible) {
+            w->shown_cursor.x = ans->x;
+            w->shown_cursor.y = ans->y;
+            w->shown_cursor.linebuf = rd->screen->linebuf;
+            w->shown_cursor.valid = true;
+        } else if (w->shown_cursor.valid && w->shown_cursor.linebuf == rd->screen->linebuf && !screen_is_overlay_active(rd->screen)) {
+            const monotonic_t hidden_for = now - rd->screen->cursor_hidden_at;
+            if (hidden_for >= 0 && hidden_for < brief_hide) {
+                ans->is_visible = true;
+                ans->x = w->shown_cursor.x;
+                ans->y = w->shown_cursor.y;
+                set_maximum_wait(brief_hide - hidden_for);
+            }
+        }
+#endif
     }
     if (!ans->is_visible && ans->multicursor_count == 0 && !rd->screen->sgr_blink_was_used) return cursor_needs_render(w);
     monotonic_t time_since_start_blink = now - os_window->cursor_blink_zero_time;
@@ -1515,7 +1837,11 @@ report_reaped_pids(void) {
         reaped_pids_count = 0;
     }
     children_mutex(unlock);
+#ifdef _WIN32
+    for (size_t n = 0; n < i; n++) { call_boss(on_monitored_pid_death, "lL", (long)pids[n].pid, pids[n].status); }
+#else
     for (size_t n = 0; n < i; n++) { call_boss(on_monitored_pid_death, "li", (long)pids[n].pid, pids[n].status); }
+#endif
 }
 
 static void *
@@ -1848,6 +2174,9 @@ process_global_state(void *data) {
     monotonic_t now = monotonic();
     if (global_state.has_pending_resizes) process_pending_resizes(now);
     parse_input(self);
+    // After parsing, so every pointer shape sequence read this tick collapses
+    // into a single change, and before rendering, so it lands on this frame.
+    apply_pending_mouse_pointer_shape();
     render(now);
 #ifdef __APPLE__
     if (has_cocoa_pending_actions) {
@@ -1915,6 +2244,12 @@ hangup(pid_t pid) {
 
 static void
 cleanup_child(ssize_t i) {
+#ifdef _WIN32
+    // Release the pty entry before its read fd is closed and the number reused,
+    // otherwise a later child that reuses the fd gets its input misrouted.
+    extern void windows_pty_close_for(int read_fd);
+    windows_pty_close_for(children[i].fd);
+#endif
     safe_close(children[i].fd, __FILE__, __LINE__);
     hangup(children[i].pid);
 }
@@ -2064,6 +2399,70 @@ reap_children(ChildMonitor *self, bool enable_close_on_child_death) {
     }
 }
 
+#ifdef _WIN32
+/* Windows has no SIGCHLD and no waitpid(-1), so nothing triggers reap_children
+ * above. The io_loop calls this each pass instead. It checks every live child's
+ * process handle and marks the exited ones for removal, reaching the same end
+ * state as the pty EOF path on Unix. One non-blocking wait per child, and child.c
+ * wakes the loop the moment a child exits.
+ *
+ * A ConPTY never reports EOF, so this is the only signal that a shell has exited.
+ * That means the window always closes on shell exit, regardless of
+ * close_on_child_death (Windows cannot tell whether a backgrounded process still
+ * holds the console, which is the case that option exists to preserve). */
+static void
+windows_reap_children(ChildMonitor *self) {
+    extern bool windows_pty_child_exited(int read_fd, int *status);
+    children_mutex(lock);
+    for (size_t i = 0; i < self->count; i++) {
+        int status = 0;
+        if (children[i].pid <= 0 || children[i].needs_removal) continue;
+        if (!windows_pty_child_exited(children[i].fd, &status)) continue;
+        children[i].needs_removal = true;
+        children[i].exit_status = status;
+        children[i].child_died = true;
+        // mirror mark_monitored_pids inline (we already hold children_lock)
+        for (ssize_t j = (ssize_t)monitored_pids_count - 1; j >= 0; j--) {
+            if (children[i].pid == monitored_pids[j]) {
+                if (reaped_pids_count < arraysz(reaped_pids)) {
+                    reaped_pids[reaped_pids_count].status = status;
+                    reaped_pids[reaped_pids_count++].pid = children[i].pid;
+                }
+                remove_i_from_array(monitored_pids, (size_t)j, monitored_pids_count);
+            }
+        }
+    }
+    // The other monitored processes, kitty's background ones, have no pty to
+    // watch and waitpid cannot wait on any child here, so each is checked by
+    // its handle. Python wakes this loop when one exits.
+    bool reaped_any = false;
+    for (ssize_t j = (ssize_t)monitored_pids_count - 1; j >= 0; j--) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, (DWORD)monitored_pids[j]);
+        DWORD code = 0;
+        bool exited = false;
+        if (!h) exited = GetLastError() == ERROR_INVALID_PARAMETER; // gone already
+        else {
+            if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+                GetExitCodeProcess(h, &code);
+                exited = true;
+            }
+            CloseHandle(h);
+        }
+        if (!exited) continue;
+        if (reaped_pids_count < arraysz(reaped_pids)) {
+            // Shifted as waitpid reports it, which os.waitstatus_to_exitcode undoes on Windows
+            reaped_pids[reaped_pids_count].status = ((long long)code) << 8;
+            reaped_pids[reaped_pids_count++].pid = monitored_pids[j];
+        }
+        remove_i_from_array(monitored_pids, (size_t)j, monitored_pids_count);
+        reaped_any = true;
+    }
+    children_mutex(unlock);
+    // The main loop reports reaped processes to Python
+    if (reaped_any) wakeup_main_loop();
+}
+#endif
+
 #ifdef KITTY_PRINT_BYTES_SENT_TO_CHILD
 static void
 print_text(const unsigned char *text, ssize_t sz) {
@@ -2081,6 +2480,13 @@ print_text(const unsigned char *text, ssize_t sz) {
 static void
 write_to_child(int fd, Screen *screen) {
     ssize_t ret = 0;
+#ifdef _WIN32
+    // On Windows the child's "fd" is the pty read side; writes must go to the
+    // ConPTY input pipe instead.
+    extern int windows_pty_write_fd_for(int read_fd);
+    int wfd = windows_pty_write_fd_for(fd);
+    if (wfd >= 0) fd = wfd;
+#endif
     screen_mutex(lock, write);
     while (screen->write_buf_start < screen->write_buf_used) {
         ret = write(fd, screen->write_buf + screen->write_buf_start, screen->write_buf_used - screen->write_buf_start);
@@ -2123,6 +2529,62 @@ write_to_child(int fd, Screen *screen) {
 // wait and the main loop would otherwise be woken for every one of them.
 #define INPUT_WAKEUP_MIN_INTERVAL (250 * MONOTONIC_T_1e3)
 #define INPUT_WAKEUP_MIN_BYTES (64u * 1024u)
+
+#ifdef _WIN32
+/* Drain graphics commands the pipe waiter queued and feed each into its target
+ * window's parser. Runs on the io_loop thread, so filling the parser write buffer
+ * here is serialized with read_bytes() the same way. */
+static void
+drain_graphics_injections(ChildMonitor *self, bool *data_received, size_t *bytes_read) {
+    GfxInjection local[GFX_QUEUE_SZ];
+    unsigned count;
+    pthread_mutex_lock(&gfx_queue_lock);
+    count = gfx_queue_count;
+    for (unsigned i = 0; i < count; i++) local[i] = gfx_queue[i];
+    gfx_queue_count = 0;
+    pthread_mutex_unlock(&gfx_queue_lock);
+    for (unsigned i = 0; i < count; i++) {
+        Screen *screen = NULL;
+        size_t child_idx = 0;
+        for (size_t c = 0; c < self->count; c++) {
+            if (children[c].id == local[i].window_id) {
+                screen = children[c].screen;
+                child_idx = c;
+                break;
+            }
+        }
+        if (screen && local[i].stream_delta) {
+            children_mutex(lock);
+            Child *child = children + child_idx;
+            if (local[i].stream_delta > 0) child->side_channel_streams++;
+            else if (child->side_channel_streams) child->side_channel_streams--;
+            if (!child->side_channel_streams && child->held_resize.pending) {
+                // The kitten let go of the screen, so the console catches up
+                // on the last size it was held back from.
+                extern int windows_pty_resize_for(int read_fd, int cols, int rows);
+                windows_pty_resize_for(child->fd, child->held_resize.cols, child->held_resize.rows);
+                child->held_resize.pending = false;
+            }
+            children_mutex(unlock);
+        } else if (screen) {
+            size_t off = 0;
+            while (off < local[i].sz) {
+                size_t space = 0;
+                uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &space);
+                if (!space) break;
+                size_t n = local[i].sz - off;
+                if (n > space) n = space;
+                memcpy(buf, local[i].data + off, n);
+                vt_parser_commit_write(screen->vt_parser, n);
+                off += n;
+            }
+            *bytes_read += off;
+            *data_received = true;
+        }
+        free(local[i].data);
+    }
+}
+#endif
 
 // poll() on children_fds with a timeout in nanoseconds, negative for no timeout, as
 // poll() itself has only millisecond resolution, which is too coarse for
@@ -2205,6 +2667,11 @@ io_loop(void *data) {
     }
 
     while (LIKELY(!self->shutting_down)) {
+#ifdef _WIN32
+        // Detect exited children (no SIGCHLD here) so remove_children below closes
+        // their window. child.c wakes this loop when a process exits.
+        windows_reap_children(self);
+#endif
         children_mutex(lock);
         // The main thread flush-parses the remove queue. It does not need a wake for a
         // child it closed itself, the SIGCHLD from the hangup wakes it.
@@ -2279,6 +2746,9 @@ io_loop(void *data) {
         } else if (ret < 0) {
             if (errno != EAGAIN && errno != EINTR) { perror("Call to poll() failed"); }
         }
+#ifdef _WIN32
+        drain_graphics_injections(self, &child_data_received, &bytes_since_input_wakeup);
+#endif
         // Waking the main loop is expensive on some platforms, such as cocoa, so it is
         // woken only if it is not already due to parse, which coalesces the wakeups of a
         // continuous stream of output into one per parse, and at most once per
@@ -2798,9 +3268,74 @@ is_render_in_progress(PyObject *self UNUSED, PyObject *args UNUSED) {
     Py_RETURN_FALSE;
 }
 
+#ifdef _WIN32
+#ifndef IO_REPARSE_TAG_AF_UNIX
+#define IO_REPARSE_TAG_AF_UNIX 0x80000023L
+#endif
+
+// The file a Unix socket leaves at its path is a reparse point with this tag
+static bool
+is_unix_socket_file(const char *path) {
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(path, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FindClose(h);
+    return (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && fd.dwReserved0 == IO_REPARSE_TAG_AF_UNIX;
+}
+
+// As remove_stale_unix_socket() in boss.py: a socket nobody accepts on, left
+// by a kitty that was killed, is removed. Returns true if it was.
+static bool
+remove_stale_unix_socket(const struct sockaddr_un *addr) {
+    if (!is_unix_socket_file(addr->sun_path)) return false;
+    SOCKET probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe == INVALID_SOCKET) return false;
+    const bool stale = connect(probe, (const struct sockaddr *)addr, sizeof(*addr)) != 0 && WSAGetLastError() == WSAECONNREFUSED;
+    closesocket(probe);
+    return stale && DeleteFileA(addr->sun_path);
+}
+
+// Windows has had Unix sockets since 1803, but CPython does not build them, so
+// listen_on unix: gets its socket here and hands it to the talk thread as the
+// tcp one is. The peer's user is checked on accept, see getpeereid.
+static PyObject *
+listen_on_unix_socket(PyObject *self UNUSED, PyObject *args) {
+    const char *path;
+    Py_ssize_t len;
+    if (!PyArg_ParseTuple(args, "s#", &path, &len)) return NULL;
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    if ((size_t)len >= sizeof(addr.sun_path)) {
+        PyErr_Format(PyExc_ValueError, "The socket path %s is too long, a Unix socket path holds at most %zu bytes", path, sizeof(addr.sun_path) - 1);
+        return NULL;
+    }
+    memcpy(addr.sun_path, path, len + 1);
+    SOCKET s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return PyErr_SetExcFromWindowsErr(PyExc_OSError, WSAGetLastError());
+    int bound = bind(s, (struct sockaddr *)&addr, sizeof(addr));
+    if (bound != 0 && WSAGetLastError() == WSAEADDRINUSE) {
+        if (remove_stale_unix_socket(&addr)) bound = bind(s, (struct sockaddr *)&addr, sizeof(addr));
+        else {
+            closesocket(s);
+            if (is_unix_socket_file(path)) PyErr_Format(PyExc_OSError, "Another process is already listening on %s", path);
+            else PyErr_Format(PyExc_OSError, "A file that is not a socket already exists at %s", path);
+            return NULL;
+        }
+    }
+    if (bound != 0 || listen(s, SOMAXCONN) != 0) {
+        const int err = WSAGetLastError();
+        closesocket(s);
+        return PyErr_SetExcFromWindowsErrWithFilename(PyExc_OSError, err, path);
+    }
+    return PyLong_FromLongLong((long long)s);
+}
+#endif
+
 static PyMethodDef module_methods[] = {
     METHODB(safe_pipe, METH_VARARGS),
     METHODB(is_render_in_progress, METH_NOARGS),
+#ifdef _WIN32
+    METHODB(listen_on_unix_socket, METH_VARARGS),
+#endif
     {"add_timer", (PyCFunction)add_python_timer, METH_VARARGS, ""},
     {"remove_timer", (PyCFunction)remove_python_timer, METH_VARARGS, ""},
     METHODB(monitor_pid, METH_VARARGS),

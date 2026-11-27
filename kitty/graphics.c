@@ -406,6 +406,18 @@ err:
 static bool
 read_img_file(GraphicsManager *self, int fd, size_t sz, off_t offset, size_t max_to_read, bool is_shm) {
     LoadData *ld = &self->currently_loading;
+#ifdef _WIN32
+    // fstat() reports st_size == 0 for these fds on Windows (they are opened
+    // with O_NONBLOCK), so ask the OS for the type and size directly, otherwise
+    // the image would read as zero bytes and fail to decode. FILE_TYPE_DISK is
+    // what a regular file reports, pipes and character devices report others.
+    HANDLE fh = (HANDLE)_get_osfhandle(fd);
+    if (fh == INVALID_HANDLE_VALUE) FABRT("The image file with fd: %d has no handle", fd);
+    if (!is_shm && GetFileType(fh) != FILE_TYPE_DISK) FABRT("The image file with fd: %d is not a regular file", fd);
+    LARGE_INTEGER fsz;
+    if (!GetFileSizeEx(fh, &fsz)) FABRT("Failed to get size of image file fd: %d", fd);
+    const int64_t file_size = fsz.QuadPart;
+#else
     struct stat s;
     if (fstat(fd, &s) != 0) FABRT("Failed to fstat() the fd: %d file with error: [%d] %s", fd, errno, strerror(errno));
     // The graphics protocol specification mandates that only regular files be
@@ -413,7 +425,9 @@ read_img_file(GraphicsManager *self, int fd, size_t sz, off_t offset, size_t max
     // side-effects. POSIX shared memory fds on macOS do not report as regular
     // files via fstat(), so skip this check for them.
     if (!is_shm && !S_ISREG(s.st_mode)) FABRT("The image file with fd: %d is not a regular file", fd);
-    const size_t available = offset < s.st_size ? (size_t)(s.st_size - offset) : 0;
+    const off_t file_size = s.st_size;
+#endif
+    const size_t available = offset < file_size ? (size_t)(file_size - offset) : 0;
     if (!sz) sz = available;
     if (sz > max_to_read) sz = max_to_read;
     free(ld->buf);
@@ -597,7 +611,7 @@ png_from_file_pointer(FILE *fp, const char *path_for_error_messages, uint8_t **d
 
 bool
 png_path_to_bitmap(const char *path, uint8_t **data, unsigned int *width, unsigned int *height, size_t *sz) {
-    FILE *fp = fopen(path, "r");
+    FILE *fp = fopen(path, "rb"); // binary: text mode corrupts PNG bytes on Windows
     if (fp == NULL) {
         log_error("The PNG image: %s could not be opened with error: %s", path, strerror(errno));
         return false;

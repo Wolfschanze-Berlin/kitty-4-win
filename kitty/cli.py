@@ -11,7 +11,7 @@ from typing import Any, NoReturn, TypeVar, cast
 
 from .cli_stub import CLIOptions
 from .conf.utils import resolve_config
-from .constants import appname, clear_handled_signals, config_dir, default_pager_for_help, defconf, is_macos, str_version, website_url
+from .constants import appname, clear_handled_signals, config_dir, default_pager_for_help, defconf, is_macos, is_windows, str_version, website_url
 from .fast_data_types import parse_cli_from_spec, wcswidth
 from .options.types import Options as KittyOpts
 from .simple_cli_definitions import (
@@ -132,7 +132,8 @@ def go_options_for_seq(seq: 'OptionSpecSeq') -> Iterator[GoOption]:
 
 
 def surround(x: str, start: int, end: int) -> str:
-    if sys.stdout.isatty():
+    # sys.stdout is None in a GUI process with no console (Windows), so guard it.
+    if sys.stdout is not None and sys.stdout.isatty():
         x = f'\033[{start}m{x}\033[{end}m'
     return x
 
@@ -327,7 +328,27 @@ def version(add_rev: bool = False) -> str:
     if add_rev and not suffix:
         if getattr(fast_data_types, 'KITTY_VCS_REV', ''):
             rev = f' ({fast_data_types.KITTY_VCS_REV[:10]})'
-    return '{} {}{} created by {}'.format(italic(appname), green(str_version + suffix), rev, title('Kovid Goyal'))
+    ans = '{} {}{} created by {}'.format(italic(appname), green(str_version + suffix), rev, title('Kovid Goyal'))
+    from .constants import is_windows
+
+    if is_windows:
+
+        def sgr(x: str, start: str, end: str) -> str:
+            if sys.stdout is not None and sys.stdout.isatty():
+                return f'\033[{start}m{x}\033[{end}m'
+            return x
+
+        # orange name (#fd971f) to match the cursor, dim brackets, cyan email
+        credit = (
+            italic('Windows native port by ')
+            + sgr('ecstra', '38;2;253;151;31', '39')
+            + ' '
+            + sgr('<', '2', '22')
+            + cyan('gotham47g@gmail.com')
+            + sgr('>', '2', '22')
+        )
+        ans += '\n' + credit
+    return ans
 
 
 def wrap(text: str, limit: int = 80) -> Iterator[str]:
@@ -467,7 +488,9 @@ class PrintHelpForSeq:
                 a('')
 
         text = '\n'.join(blocks) + '\n\n' + version()
-        if print_help_for_seq.allow_pager and sys.stdout.isatty():
+        # Windows has no pager kitty can count on, and a Popen with preexec_fn
+        # fails there, so the help goes straight to the console
+        if print_help_for_seq.allow_pager and sys.stdout.isatty() and not is_windows:
             import subprocess
 
             try:

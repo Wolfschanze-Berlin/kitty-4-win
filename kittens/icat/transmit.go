@@ -13,7 +13,9 @@ import (
 	not_rand "math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	shm "github.com/kovidgoyal/go-shm/v2"
 	"github.com/kovidgoyal/kitty/tools/tui"
@@ -24,6 +26,56 @@ import (
 )
 
 var _ = fmt.Print
+
+// On Windows, conhost (ConPTY) re-renders the shell's output and drops the kitty
+// graphics protocol APC, so it never reaches kitty. When windows_gfx_bypass is set
+// (see main), the graphics commands are accumulated here and sent straight to kitty
+// over a named pipe instead of stdout; the image is placed with unicode
+// placeholders, which are plain text and pass through conhost untouched.
+var windows_gfx_bypass bool
+var gfx_buf bytes.Buffer
+
+// graphics_writer returns where a graphics command should be written: the bypass
+// buffer on Windows, otherwise stdout.
+func graphics_writer() io.StringWriter {
+	if windows_gfx_bypass {
+		return &gfx_buf
+	}
+	return os.Stdout
+}
+
+// send_graphics_to_kitty delivers accumulated graphics command bytes to kitty over
+// its per-process named pipe, prefixed with the target window id, bypassing conhost.
+func send_graphics_to_kitty(data []byte) error {
+	pid := os.Getenv("KITTY_PID")
+	wid := os.Getenv("KITTY_WINDOW_ID")
+	if pid == "" || wid == "" {
+		return fmt.Errorf("KITTY_PID/KITTY_WINDOW_ID not set; cannot reach kitty graphics pipe")
+	}
+	window_id, err := strconv.ParseUint(wid, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid KITTY_WINDOW_ID %q: %w", wid, err)
+	}
+	pipe_name := `\\.\pipe\kitty-gfx-` + pid
+	var f *os.File
+	for attempt := 0; attempt < 100; attempt++ {
+		if f, err = os.OpenFile(pipe_name, os.O_WRONLY, 0); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond) // pipe momentarily has no free instance between server accepts
+	}
+	if err != nil {
+		return fmt.Errorf("failed to connect to kitty graphics pipe: %w", err)
+	}
+	defer f.Close()
+	var header [8]byte
+	binary.LittleEndian.PutUint64(header[:], window_id)
+	if _, err = f.Write(header[:]); err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	return err
+}
 
 type passthrough_type int
 
@@ -116,7 +168,7 @@ func transmit_shm(imgd *image_data, frame_num int, frame *image_frame) (err erro
 	gc := gc_for_image(imgd, frame_num, frame)
 	gc.SetTransmission(graphics.GRT_transmission_sharedmem)
 	gc.SetDataSize(uint64(data_size))
-	err = gc.WriteWithPayloadTo(os.Stdout, utils.UnsafeStringToBytes(mmap.Name()))
+	err = gc.WriteWithPayloadTo(graphics_writer(), utils.UnsafeStringToBytes(mmap.Name()))
 	return
 }
 
@@ -128,6 +180,9 @@ func transmit_file(imgd *image_data, frame_num int, frame *image_frame) (err err
 		fname, err = filepath.Abs(frame.filename)
 		if err != nil {
 			return fmt.Errorf("Failed to convert image data output file: %s to absolute path with error: %w", frame.filename, err)
+		}
+		if on_another_machine(fname) {
+			return transmit_stream(imgd, frame_num, frame)
 		}
 		frame.filename = "" // so it isn't deleted in cleanup
 	} else {
@@ -150,7 +205,7 @@ func transmit_file(imgd *image_data, frame_num int, frame *image_frame) (err err
 	if data_size > 0 {
 		gc.SetDataSize(uint64(data_size))
 	}
-	return gc.WriteWithPayloadTo(os.Stdout, utils.UnsafeStringToBytes(fname))
+	return gc.WriteWithPayloadTo(graphics_writer(), utils.UnsafeStringToBytes(fname))
 }
 
 func transmit_stream(imgd *image_data, frame_num int, frame *image_frame) (err error) {
@@ -162,7 +217,7 @@ func transmit_stream(imgd *image_data, frame_num int, frame *image_frame) (err e
 		}
 	}
 	gc := gc_for_image(imgd, frame_num, frame)
-	return gc.WriteWithPayloadTo(os.Stdout, data)
+	return gc.WriteWithPayloadTo(graphics_writer(), data)
 }
 
 func calculate_in_cell_x_offset(width, cell_width int) int {
@@ -222,7 +277,15 @@ func write_unicode_placeholder(imgd *image_data) {
 	prefix := ""
 	buf := strings.Builder{}
 	buf.Grow(imgd.height_cells * (imgd.width_cells*16 + 16))
-	fmt.Fprintf(&buf, "\033[38:2:%d:%d:%dm", (imgd.image_id>>16)&255, (imgd.image_id>>8)&255, imgd.image_id&255)
+	r, g, b := (imgd.image_id>>16)&255, (imgd.image_id>>8)&255, imgd.image_id&255
+	// The lower 24 bits of the image id are carried in this foreground colour.
+	// conhost forwards only the legacy semicolon-form truecolor SGR, not the colon
+	// (ITU) form kitty normally uses, so fall back to semicolons on Windows.
+	if windows_gfx_bypass {
+		fmt.Fprintf(&buf, "\033[38;2;%d;%d;%dm", r, g, b)
+	} else {
+		fmt.Fprintf(&buf, "\033[38:2:%d:%d:%dm", r, g, b)
+	}
 	restore := "\033[39m"
 	if imgd.move_to.y > 0 {
 		buf.WriteString(loop.SAVE_CURSOR)
@@ -242,6 +305,14 @@ func write_unicode_placeholder(imgd *image_data) {
 		}
 		for c := 0; c < imgd.width_cells; c++ {
 			buf.WriteRune(kitty.ImagePlaceholderChar)
+			if windows_gfx_bypass && c > 0 {
+				// Only the first cell of each row carries the row/column/id diacritics;
+				// kitty infers the rest from the run. Bare cells are a single column, so
+				// conhost (which counts each combining diacritic as an extra column) no
+				// longer over-counts the row width and wraps it, which was desyncing its
+				// cursor from kitty's and making the prompt jump.
+				continue
+			}
 			buf.WriteRune(images.NumberToDiacritic[r])
 			buf.WriteRune(images.NumberToDiacritic[c])
 			buf.WriteRune(id_char)
@@ -259,6 +330,9 @@ var seen_image_ids *utils.Set[uint32]
 func transmit_image(imgd *image_data, no_trailing_newline bool) {
 	if seen_image_ids == nil {
 		seen_image_ids = utils.NewSet[uint32](32)
+	}
+	if windows_gfx_bypass {
+		gfx_buf.Reset()
 	}
 	var f func(*image_data, int, *image_frame) error
 	if opts.TransferMode != "detect" {
@@ -348,13 +422,13 @@ func transmit_image(imgd *image_data, no_trailing_newline bool) {
 				case opts.Loop > 0:
 					c.SetNumberOfLoops(uint64(opts.Loop) + 1)
 				}
-				if imgd.err = c.WriteWithPayloadTo(os.Stdout, nil); imgd.err != nil {
+				if imgd.err = c.WriteWithPayloadTo(graphics_writer(), nil); imgd.err != nil {
 					return
 				}
 			case 1:
 				c := frame_control_cmd
 				c.SetAnimationControl(2) // set animation to loading mode
-				if imgd.err = c.WriteWithPayloadTo(os.Stdout, nil); imgd.err != nil {
+				if imgd.err = c.WriteWithPayloadTo(graphics_writer(), nil); imgd.err != nil {
 					return
 				}
 			}
@@ -366,11 +440,19 @@ func transmit_image(imgd *image_data, no_trailing_newline bool) {
 	if is_animated {
 		c := frame_control_cmd
 		c.SetAnimationControl(3) // set animation to normal mode
-		if imgd.err = c.WriteWithPayloadTo(os.Stdout, nil); imgd.err != nil {
+		if imgd.err = c.WriteWithPayloadTo(graphics_writer(), nil); imgd.err != nil {
 			return
 		}
 	}
 	if imgd.move_to.x == 0 && !no_trailing_newline {
 		fmt.Println() // ensure cursor is on new line
+	}
+	if windows_gfx_bypass && gfx_buf.Len() > 0 {
+		// Flush the accumulated graphics commands to kitty over the side channel.
+		// The placeholders above are already on stdout; kitty resolves them to the
+		// image the next time it renders after this transmit loads it.
+		if err := send_graphics_to_kitty(gfx_buf.Bytes()); err != nil {
+			imgd.err = err
+		}
 	}
 }

@@ -3706,7 +3706,10 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
         }
         if (os_window->live_resize.in_progress) {
             restore_viewport();
+#ifndef _WIN32
+            // The "WxH cells" banner is distracting on the Windows custom frame; skip it.
             draw_resizing_text(os_window);
+#endif
         }
     }
     draw_software_rendering_banner(os_window, now);
